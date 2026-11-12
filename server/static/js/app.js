@@ -31,6 +31,35 @@ class LiveModeController {
     this._silenceTimer = null;
     this._lastSpokenText = '';
 
+    // Neural Silero VAD Manager for Instant Barge-In (Interruption)
+    this._vad = new SileroVADManager({
+      positiveSpeechThreshold: 0.5,
+      negativeSpeechThreshold: 0.35,
+      onSpeechStart: () => {
+        if (!this.isActive || this.isMuted) return;
+        // If Jarvis is currently speaking, Boss spoke -> INTERRUPT IMMEDIATELY!
+        if (this.state === 'speaking' || this.app.audioPlayer.isPlaying) {
+          console.log('[LiveMode] Silero VAD detected user speech during playback -> Cutting off Jarvis audio!');
+          this.app.audioPlayer.stop();
+          this.setState('listening');
+          this.startListening();
+        }
+      },
+      onSpeechEnd: () => {
+        if (!this.isActive || this.isMuted) return;
+        // When Silero VAD confirms voice stopped, trigger fast STT flush if text exists
+        if (this.state === 'listening' && this._lastSpokenText) {
+          console.log('[LiveMode] Silero VAD confirmed silence -> Dispatching query to Boss assistant.');
+          const toSend = this._lastSpokenText;
+          this._lastSpokenText = '';
+          clearTimeout(this._silenceTimer);
+          clearTimeout(this._restartTimer);
+          this._stt.stopListening();
+          this._handleUserSpoke(toSend);
+        }
+      }
+    });
+
     // Dedicated SpeechRecognition instance for Live Mode with smart fast-endpointing
     this._stt = new SpeechRecognitionManager({
       onStart: () => {
@@ -152,6 +181,9 @@ class LiveModeController {
       requestAnimationFrame(() => this.overlay.classList.add('open'));
     }
 
+    // Start background Neural Silero VAD for instant voice barge-in
+    this._vad.start().catch((e) => console.warn('[LiveMode] Silero VAD start warning:', e));
+
     this.startListening();
   }
 
@@ -159,6 +191,7 @@ class LiveModeController {
     this.isActive = false;
     clearTimeout(this._restartTimer);
     this._stt.abort();
+    this._vad.stop();
     this.app.audioPlayer.stop();
     this.setState('idle');
 
@@ -177,8 +210,10 @@ class LiveModeController {
     if (this.isMuted) {
       clearTimeout(this._restartTimer);
       this._stt.abort();
+      this._vad.stop();
       if (this.state === 'listening') this.setState('paused');
     } else {
+      this._vad.start().catch(() => {});
       if (this.state === 'paused' || this.state === 'idle') {
         this.startListening();
       }
