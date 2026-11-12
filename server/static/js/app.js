@@ -74,10 +74,9 @@ class LiveModeController {
         }
         if (text) {
           this._lastSpokenText = text;
-          // Fast-endpointing: don't wait 1.5s for Chrome — dispatch 450ms after speech pauses!
+          // Natural conversational pause: give 1.2s of real pause so Boss can breathe & speak naturally
           clearTimeout(this._silenceTimer);
-          const words = text.split(/\s+/).length;
-          const delay = isFinal ? 50 : (words >= 2 ? 450 : 800);
+          const delay = 1200;
           this._silenceTimer = setTimeout(() => {
             if (this.isActive && this.state === 'listening' && this._lastSpokenText) {
               const toSend = this._lastSpokenText;

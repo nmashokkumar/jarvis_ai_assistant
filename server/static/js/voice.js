@@ -171,7 +171,7 @@ class SpeechRecognitionManager {
   _create() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     const r = new SR();
-    r.continuous = false;
+    r.continuous = true; // Continuous listening so browser doesn't abruptly cut off mid-thought!
     r.interimResults = true;
     r.lang = 'en-IN'; // Indian English recognition for accurate accent comprehension
     r.maxAlternatives = 1;

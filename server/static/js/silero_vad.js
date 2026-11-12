@@ -12,7 +12,7 @@ class SileroVADManager {
     onVADMisfire,
     positiveSpeechThreshold = 0.5,
     negativeSpeechThreshold = 0.35,
-    redemptionFrames = 8, // ~256ms of silence before declaring speech end
+    redemptionFrames = 30, // ~1000ms (1 second) of real silence before declaring turn end
     preSpeechPadFrames = 1,
     minSpeechFrames = 3   // ~96ms minimum voice duration to trigger
   } = {}) {
