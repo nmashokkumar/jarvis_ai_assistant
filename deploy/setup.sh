@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# =============================================================================
+# JARVIS Setup Script
+# Runs on the server to install and configure the JARVIS service.
+# Safe to run multiple times (idempotent).
+# =============================================================================
+
+set -euo pipefail
+
+# --- Colors ------------------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# --- Helpers -----------------------------------------------------------------
+info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
+success() { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+step()    { echo -e "\n${BOLD}${CYAN}==> $*${NC}"; }
+
+# --- Config ------------------------------------------------------------------
+APP_DIR="/opt/jarvis"
+VENV_DIR="${APP_DIR}/venv"
+ENV_FILE="${APP_DIR}/.env"
+SERVICE_NAME="jarvis"
+PYTHON_BIN="python3"
+
+# Determine the directory this script lives in (source of app files)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# App source is one level up from deploy/
+APP_SRC="$(dirname "${SCRIPT_DIR}")/server"
+
+# =============================================================================
+# Pre-flight checks
+# =============================================================================
+step "Pre-flight checks"
+
+if [[ $EUID -ne 0 ]]; then
+    error "This script must be run as root (sudo ./setup.sh)"
+fi
+
+command -v python3 >/dev/null 2>&1 || error "python3 is not installed"
+command -v pip3   >/dev/null 2>&1 || command -v pip >/dev/null 2>&1 || \
+    warn "pip not found in PATH — will rely on venv pip"
+command -v nginx  >/dev/null 2>&1 || error "nginx is not installed"
+command -v systemctl >/dev/null 2>&1 || error "systemd is required"
+
+PYTHON_VERSION=$("${PYTHON_BIN}" --version 2>&1)
+info "Using ${PYTHON_VERSION}"
+success "Pre-flight checks passed"
+
+# =============================================================================
+# Directory structure
+# =============================================================================
+step "Creating directory structure"
+
+for dir in \
+    "${APP_DIR}" \
+    "${APP_DIR}/logs" \
+    "${APP_DIR}/backups" \
+    "${APP_DIR}/data"; do
+    if [[ ! -d "${dir}" ]]; then
+        mkdir -p "${dir}"
+        info "Created ${dir}"
+    else
+        info "Exists  ${dir}"
+    fi
+done
+success "Directories ready"
+
+# =============================================================================
+# Python virtual environment
+# =============================================================================
+step "Setting up Python virtual environment"
+
+if [[ ! -f "${VENV_DIR}/bin/activate" ]]; then
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+    success "Virtual environment created at ${VENV_DIR}"
+else
+    success "Virtual environment already exists — skipping creation"
+fi
+
+# Upgrade pip inside the venv
+"${VENV_DIR}/bin/pip" install --quiet --upgrade pip
+success "pip upgraded"
+
+# =============================================================================
+# Copy application files
+# =============================================================================
+step "Copying application files"
+
+if [[ -d "${APP_SRC}" ]]; then
+    rsync -a --exclude '__pycache__' --exclude '*.pyc' --exclude '.env' \
+        "${APP_SRC}/" "${APP_DIR}/"
+    success "App files copied from ${APP_SRC}"
+else
+    warn "Source directory '${APP_SRC}' not found — skipping file copy."
+    warn "If you are running setup.sh directly on the server, ensure your app"
+    warn "files are already present in ${APP_DIR}/"
+fi
+
+# =============================================================================
+# Install Python dependencies
+# =============================================================================
+step "Installing Python dependencies"
+
+REQUIREMENTS="${APP_DIR}/requirements.txt"
+if [[ -f "${REQUIREMENTS}" ]]; then
+    "${VENV_DIR}/bin/pip" install \
+        --no-cache-dir \
+        --quiet \
+        -r "${REQUIREMENTS}"
+    success "Dependencies installed from requirements.txt"
+else
+    error "requirements.txt not found at ${REQUIREMENTS}"
+fi
+
+# =============================================================================
+# Create .env file (only if it does not already exist)
+# =============================================================================
+step "Configuring environment file"
+
+if [[ -f "${ENV_FILE}" ]]; then
+    warn ".env already exists at ${ENV_FILE} — skipping creation."
+    warn "Delete it and re-run if you want to reset to defaults."
+else
+    cat > "${ENV_FILE}" << 'EOF'
+# =============================================================================
+# JARVIS Environment Configuration
+# Generated by setup.sh — edit these values before starting the service.
+# =============================================================================
+
+# SECURITY — CHANGE THIS before exposing JARVIS to any network!
+SECRET_TOKEN=jarvis-secret-change-me   # CHANGE THIS!
+
+# Ollama settings
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2:3b
+
+# Database
+DB_PATH=/opt/jarvis/jarvis.db
+EOF
+    success ".env created at ${ENV_FILE}"
+    echo ""
+    warn "⚠  Remember to set a strong SECRET_TOKEN in ${ENV_FILE} before use!"
+fi
+
+# =============================================================================
+# File permissions
+# =============================================================================
+step "Setting file permissions"
+
+# App files readable by root (service runs as root on personal server)
+chown -R root:root "${APP_DIR}"
+chmod -R 755 "${APP_DIR}"
+# .env should only be readable by root
+chmod 600 "${ENV_FILE}"
+# Writable data dirs
+chmod 700 "${APP_DIR}/data" "${APP_DIR}/backups" "${APP_DIR}/logs"
+
+success "Permissions set"
+
+# =============================================================================
+# Install systemd service
+# =============================================================================
+step "Installing systemd service"
+
+SERVICE_FILE="${SCRIPT_DIR}/jarvis.service"
+SYSTEMD_DEST="/etc/systemd/system/${SERVICE_NAME}.service"
+
+if [[ -f "${SERVICE_FILE}" ]]; then
+    cp "${SERVICE_FILE}" "${SYSTEMD_DEST}"
+    chmod 644 "${SYSTEMD_DEST}"
+    success "Service file installed to ${SYSTEMD_DEST}"
+else
+    warn "jarvis.service not found at ${SERVICE_FILE}"
+    warn "Please copy it manually to ${SYSTEMD_DEST}"
+fi
+
+systemctl daemon-reload
+systemctl enable "${SERVICE_NAME}"
+success "Service enabled"
+
+# =============================================================================
+# Install Nginx config
+# =============================================================================
+step "Installing Nginx configuration"
+
+NGINX_CONF_SRC="${SCRIPT_DIR}/nginx.conf"
+NGINX_CONF_DEST="/etc/nginx/sites-available/jarvis"
+NGINX_ENABLED="/etc/nginx/sites-enabled/jarvis"
+
+if [[ -f "${NGINX_CONF_SRC}" ]]; then
+    cp "${NGINX_CONF_SRC}" "${NGINX_CONF_DEST}"
+    # Remove default site if it exists
+    [[ -L "/etc/nginx/sites-enabled/default" ]] && \
+        rm -f "/etc/nginx/sites-enabled/default" && \
+        info "Removed default nginx site"
+    # Enable our site
+    ln -sf "${NGINX_CONF_DEST}" "${NGINX_ENABLED}"
+    # Test config
+    nginx -t 2>/dev/null && success "Nginx config valid" || \
+        error "Nginx config test failed — check /etc/nginx/sites-available/jarvis"
+    systemctl reload nginx
+    success "Nginx configured and reloaded"
+else
+    warn "nginx.conf not found at ${NGINX_CONF_SRC} — skipping Nginx setup"
+fi
+
+# =============================================================================
+# Start / restart JARVIS service
+# =============================================================================
+step "Starting JARVIS service"
+
+systemctl restart "${SERVICE_NAME}"
+sleep 3  # Give uvicorn a moment to start
+
+if systemctl is-active --quiet "${SERVICE_NAME}"; then
+    success "JARVIS service is running"
+else
+    error "JARVIS service failed to start. Check logs: journalctl -u ${SERVICE_NAME} -n 50"
+fi
+
+# =============================================================================
+# Health check
+# =============================================================================
+step "Running API health check"
+
+MAX_ATTEMPTS=10
+ATTEMPT=0
+while [[ ${ATTEMPT} -lt ${MAX_ATTEMPTS} ]]; do
+    ATTEMPT=$(( ATTEMPT + 1 ))
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        --max-time 5 http://localhost:8000/api/health 2>/dev/null || echo "000")
+    if [[ "${HTTP_CODE}" == "200" ]]; then
+        success "Health check passed (HTTP ${HTTP_CODE})"
+        break
+    fi
+    info "Attempt ${ATTEMPT}/${MAX_ATTEMPTS} — got HTTP ${HTTP_CODE}, retrying..."
+    sleep 2
+done
+
+if [[ "${HTTP_CODE}" != "200" ]]; then
+    warn "Health check did not return 200 after ${MAX_ATTEMPTS} attempts."
+    warn "The service may still be starting up. Check: curl localhost:8000/api/health"
+fi
+
+# =============================================================================
+# Done!
+# =============================================================================
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+echo ""
+echo -e "${BOLD}${GREEN}============================================================${NC}"
+echo -e "${BOLD}${GREEN}  JARVIS is deployed and running!${NC}"
+echo -e "${BOLD}${GREEN}============================================================${NC}"
+echo ""
+echo -e "  ${BOLD}Local API:${NC}   http://localhost:8000"
+echo -e "  ${BOLD}Network:${NC}     http://${SERVER_IP}"
+echo -e "  ${BOLD}Health:${NC}      http://localhost:8000/api/health"
+echo ""
+echo -e "  ${BOLD}Logs:${NC}        journalctl -u jarvis -f"
+echo -e "  ${BOLD}Restart:${NC}     systemctl restart jarvis"
+echo -e "  ${BOLD}Config:${NC}      ${ENV_FILE}"
+echo ""
+echo -e "  ${YELLOW}⚠  Change SECRET_TOKEN in ${ENV_FILE} before production use!${NC}"
+echo ""

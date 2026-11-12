@@ -1,0 +1,50 @@
+# =============================================================================
+# JARVIS Systemd Service Unit
+# Install to: /etc/systemd/system/jarvis.service
+# After installing: systemctl daemon-reload && systemctl enable jarvis
+# =============================================================================
+
+[Unit]
+Description=JARVIS Personal AI Assistant
+Documentation=https://github.com/youruser/jarvis
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=root
+
+# Working directory (all relative paths resolve here)
+WorkingDirectory=/opt/jarvis
+
+# Load secrets and config from .env
+EnvironmentFile=/opt/jarvis/.env
+
+# Start uvicorn with a single worker (Llama is memory-heavy)
+ExecStart=/opt/jarvis/venv/bin/uvicorn main:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 1 \
+    --log-level info \
+    --access-log
+
+# Graceful shutdown
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# Restart policy — always restart on failure
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Logging — view with: journalctl -u jarvis -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jarvis
+
+# Resource limits (adjust to server specs)
+# Uncomment to restrict memory if needed:
+# MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

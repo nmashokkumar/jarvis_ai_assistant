@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>J.A.R.V.I.S. — Personal AI Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Orbitron:wght@500;700;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='45' fill='%2306090e' stroke='%2300e5ff' stroke-width='4'/><circle cx='50' cy='50' r='20' fill='%2300e5ff'/></svg>">
+</head>
+<body>
+
+  <!-- ===================================================================== -->
+  <!-- 1. LOGIN / AUTHENTICATION OVERLAY                                      -->
+  <!-- ===================================================================== -->
+  <div id="login-screen" class="login-overlay hidden">
+    <div class="login-card">
+      <div class="arc-reactor-logo small">
+        <svg viewBox="0 0 100 100" class="reactor-svg">
+          <circle class="ring ring-outer-dashed" cx="50" cy="50" r="44"/>
+          <circle class="ring ring-mid-rot" cx="50" cy="50" r="34"/>
+          <circle class="ring ring-inner" cx="50" cy="50" r="22"/>
+          <circle class="core-glow pulsing" cx="50" cy="50" r="14"/>
+        </svg>
+      </div>
+      <h1 class="hud-glitch-title">J.A.R.V.I.S.</h1>
+      <p class="login-subtitle">PERSONAL AI ASSISTANT // BOSS ACCESS</p>
+
+      <div class="login-form">
+        <div class="input-glow-group">
+          <input type="password" id="login-token-input" placeholder="Enter Access Token..." autocomplete="off">
+        </div>
+        <div class="input-glow-group">
+          <input type="text" id="login-server-url" placeholder="Server URL (optional — auto if hosted)" autocomplete="off">
+        </div>
+        <button id="login-submit-btn" class="hud-primary-btn">
+          <span>INITIALIZE J.A.R.V.I.S.</span>
+        </button>
+      </div>
+      <div class="login-footer">
+        <span>PRIVATE &bull; ENCRYPTED &bull; VOICE ENABLED</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- 2. MAIN APPLICATION HUD                                               -->
+  <!-- ===================================================================== -->
+  <div id="app-screen" class="app-layout">
+
+    <!-- Mobile Sidebar Backdrop -->
+    <div id="sidebar-overlay" class="sidebar-backdrop"></div>
+
+    <!-- SIDEBAR NAVIGATION -->
+    <aside id="sidebar" class="hud-sidebar">
+      <div class="sidebar-brand">
+        <div class="arc-reactor-logo mini">
+          <svg viewBox="0 0 100 100" class="reactor-svg">
+            <circle class="ring ring-outer-dashed" cx="50" cy="50" r="44"/>
+            <circle class="ring ring-mid-rot" cx="50" cy="50" r="32"/>
+            <circle class="core-glow" cx="50" cy="50" r="14"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h2>J.A.R.V.I.S.</h2>
+          <span class="brand-sub">PERSONAL AI ASSISTANT</span>
+        </div>
+      </div>
+
+      <div class="sidebar-action">
+        <button id="new-chat-btn" class="hud-btn new-chat-btn">
+          <span class="icon">+</span>
+          <span>New Chat</span>
+        </button>
+      </div>
+
+      <!-- Mode Selector -->
+      <div class="sidebar-mode">
+        <span class="section-label">PERSONALITY MODE</span>
+        <button id="mode-toggle-btn" class="mode-pill-btn" title="Click to switch between Regular and Productivity mode">
+          <span class="mode-icon">🤖</span> Regular Mode
+        </button>
+      </div>
+
+      <!-- History List -->
+      <div class="sidebar-history">
+        <span class="section-label">CONVERSATIONS</span>
+        <div id="conv-list" class="conv-scroll-container">
+          <!-- Dynamic conversation items rendered here -->
+        </div>
+      </div>
+
+      <!-- Clean Personal Footer -->
+      <div class="sidebar-footer">
+        <div class="server-telemetry">
+          <span class="telemetry-item">⚡ Always Ready</span>
+          <span class="telemetry-item">🔒 Private Mode</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- MAIN CHAT VIEW -->
+    <main class="hud-main">
+
+      <!-- Top Navigation Bar -->
+      <header class="hud-header">
+        <div class="header-left">
+          <button id="sidebar-toggle" class="hud-icon-btn mobile-only" title="Toggle Navigation">
+            <svg viewBox="0 0 24 24" width="22" height="22" stroke="currentColor" fill="none" stroke-width="2">
+              <line x1="3" y1="12" x2="21" y2="12"></line>
+              <line x1="3" y1="6" x2="21" y2="6"></line>
+              <line x1="3" y1="18" x2="21" y2="18"></line>
+            </svg>
+          </button>
+          <div class="status-indicator-box">
+            <span id="status-indicator" class="status-dot online"></span>
+            <span id="status-text" class="status-label">ONLINE</span>
+          </div>
+          <span id="header-mode-badge" class="header-mode-pill">🤖 REGULAR</span>
+        </div>
+
+        <div class="header-center">
+          <span class="hud-clock" id="hud-clock">00:00:00</span>
+        </div>
+
+        <div class="header-right">
+          <!-- One-Click Live Voice Mode Button -->
+          <button id="header-live-btn" class="live-header-btn" title="Start Live Voice Conversation">
+            <span class="live-dot"></span>
+            <span>Live</span>
+          </button>
+          <!-- Quick Panel Shortcuts -->
+          <button class="panel-nav-btn hud-icon-btn" data-panel="reminders" title="Reminders">⏰</button>
+          <button class="panel-nav-btn hud-icon-btn" data-panel="todos" title="Tasks">✅</button>
+          <button class="panel-nav-btn hud-icon-btn" data-panel="notes" title="Notes">📝</button>
+          <button class="panel-nav-btn hud-icon-btn" data-panel="calendar" title="Schedule & Calendar">📅</button>
+          <button class="panel-nav-btn hud-icon-btn" data-panel="settings" title="System Settings">⚙️</button>
+        </div>
+      </header>
+
+      <!-- Chat Container -->
+      <section class="chat-viewport">
+        <!-- Empty State Starter -->
+        <div id="empty-state" class="empty-state">
+          <div class="arc-reactor-logo large">
+            <svg viewBox="0 0 100 100" class="reactor-svg animated">
+              <circle class="ring ring-outer-dashed" cx="50" cy="50" r="45"/>
+              <circle class="ring ring-mid-rot" cx="50" cy="50" r="32"/>
+              <circle class="ring ring-inner" cx="50" cy="50" r="20"/>
+              <circle class="core-glow pulsing" cx="50" cy="50" r="12"/>
+            </svg>
+          </div>
+          <h2 class="welcome-heading">At your service, Boss.</h2>
+          <p class="welcome-sub">Talk to me in Live Mode, use voice input, or type below.</p>
+
+          <div class="starter-chips">
+            <button class="starter-chip" data-prompt="What are my schedules today?">
+              <span class="chip-icon">📅</span> What are my schedules today?
+            </button>
+            <button class="starter-chip" data-prompt="What's the current stock price of NVIDIA?">
+              <span class="chip-icon">📈</span> What's the stock price of NVIDIA?
+            </button>
+            <button class="starter-chip" data-prompt="What's the weather in Chennai today?">
+              <span class="chip-icon">🌤️</span> Weather forecast for Chennai
+            </button>
+            <button class="starter-chip" data-prompt="Remind me at 5 PM to call Mom">
+              <span class="chip-icon">⏰</span> Remind me at 5 PM to call Mom
+            </button>
+          </div>
+        </div>
+
+        <!-- Dynamic Message Stream -->
+        <div id="chat-stream" class="chat-stream"></div>
+
+        <!-- Thinking / Generation Indicator -->
+        <div id="thinking-indicator" class="thinking-indicator">
+          <div class="pulse-wave">
+            <span></span><span></span><span></span>
+          </div>
+          <span class="thinking-label">J.A.R.V.I.S. is thinking...</span>
+        </div>
+      </section>
+
+      <!-- Bottom Floating Input Dock -->
+      <footer class="hud-dock">
+        <div id="input-bar" class="dock-container">
+          <textarea id="message-input" placeholder="Message Jarvis, Boss... (Enter to send)" rows="1"></textarea>
+
+          <div class="dock-actions">
+            <!-- Quick Single Mic Input -->
+            <button id="mic-btn" class="hud-circle-btn mic-btn" title="Voice Input (One-shot)">
+              <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" fill="none" stroke-width="2">
+                <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                <line x1="12" y1="19" x2="12" y2="23"></line>
+                <line x1="8" y1="23" x2="16" y2="23"></line>
+              </svg>
+              <div class="mic-wave"></div>
+            </button>
+
+            <!-- Hands-Free Live Mode Button (Gemini Live Style) -->
+            <button id="live-mode-btn" class="hud-circle-btn live-dock-btn" title="Enter Hands-Free Live Mode">
+              <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" fill="none" stroke-width="2.2">
+                <line x1="4" y1="9" x2="4" y2="15"></line>
+                <line x1="9" y1="5" x2="9" y2="19"></line>
+                <line x1="14" y1="3" x2="14" y2="21"></line>
+                <line x1="19" y1="8" x2="19" y2="16"></line>
+              </svg>
+            </button>
+
+            <!-- Send Button -->
+            <button id="send-btn" class="hud-circle-btn send-btn" title="Send Message">
+              <svg viewBox="0 0 24 24" width="19" height="19" stroke="currentColor" fill="none" stroke-width="2.2">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </footer>
+    </main>
+
+    <!-- =================================================================== -->
+    <!-- 3. FULL-SCREEN LIVE CONVERSATION OVERLAY (Gemini Live Style)        -->
+    <!-- =================================================================== -->
+    <div id="live-overlay" class="live-overlay hidden" data-state="idle">
+      <div class="live-topbar">
+        <div class="live-brand">
+          <span class="live-dot pulse"></span>
+          <span>J.A.R.V.I.S. LIVE</span>
+        </div>
+        <div id="live-connection-note" class="live-preview-badge hidden">
+          Preview Mode — Connect server in Settings for full AI
+        </div>
+      </div>
+
+      <div class="live-center">
+        <!-- Reactive Glowing Orb -->
+        <button id="live-orb" class="live-orb" title="Tap to interrupt or toggle listening">
+          <div class="orb-halo halo-1"></div>
+          <div class="orb-halo halo-2"></div>
+          <div class="orb-core">
+            <svg viewBox="0 0 120 120" class="orb-svg">
+              <circle class="orb-ring-outer" cx="60" cy="60" r="54"/>
+              <circle class="orb-ring-mid" cx="60" cy="60" r="40"/>
+              <circle class="orb-ring-inner" cx="60" cy="60" r="24"/>
+            </svg>
+            <div class="orb-eq-bars">
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+          </div>
+        </button>
+
+        <div id="live-state-label" class="live-state-label">LISTENING TO BOSS...</div>
+
+        <!-- Live Subtitles / Captions -->
+        <div class="live-captions">
+          <div id="live-user-caption" class="caption-user"></div>
+          <div id="live-jarvis-caption" class="caption-jarvis">Listening, Boss...</div>
+        </div>
+      </div>
+
+      <div class="live-controls">
+        <button id="live-mute-btn" class="live-ctrl-btn">
+          <span>🎙️</span><span>Pause Mic</span>
+        </button>
+        <button id="live-end-btn" class="live-ctrl-btn end-call">
+          <span>✕</span><span>End Live</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- =================================================================== -->
+    <!-- 4. SLIDE-OVER DRAWER (Notes, Todos, Reminders, Calendar, Settings)   -->
+    <!-- =================================================================== -->
+    <div id="panel-drawer" class="hud-drawer" aria-hidden="true">
+      <div class="drawer-panel">
+        <div class="drawer-header">
+          <h3 id="panel-title">System Module</h3>
+          <button id="panel-close-btn" class="hud-icon-btn close-btn" title="Close Panel">✕</button>
+        </div>
+        <div id="panel-body" class="drawer-body">
+          <!-- Dynamic panel content injected here -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast Notifications Container -->
+    <div id="toast-container" class="toast-container"></div>
+  </div>
+
+  <!-- Scripts -->
+  <script src="js/utils.js"></script>
+  <script src="js/voice.js"></script>
+  <script src="js/chat.js"></script>
+  <script src="js/panels.js"></script>
+  <script src="js/app.js"></script>
+
+  <!-- Live HUD Clock Script -->
+  <script>
+    function updateClock() {
+      const el = document.getElementById('hud-clock');
+      if (el) {
+        const now = new Date();
+        el.textContent = now.toLocaleTimeString('en-US', { hour12: false });
+      }
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+  </script>
+</body>
+</html>
