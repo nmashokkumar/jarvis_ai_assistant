@@ -119,6 +119,16 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("Scheduler started")
 
+    # Pre-warm Kokoro TTS engine so the first spoken turn is instant
+    if getattr(settings, "TTS_ENGINE", "kokoro").lower() == "kokoro":
+        try:
+            from voice.tts import _get_kokoro
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _get_kokoro)
+            logger.info("Kokoro ONNX engine pre-warmed (voice: %s)", getattr(settings, 'KOKORO_VOICE', 'af_heart'))
+        except Exception as tts_init_err:
+            logger.warning("Kokoro pre-warm warning: %s", tts_init_err)
+
     yield
 
     # Teardown

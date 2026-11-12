@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Large Model Weights & Checkpoints (Store on Hugging Face / Git LFS)
+models/emotion_model/model.safetensors
+models/emotion_model_1/model.safetensors
+models/voice_model/model.safetensors
+models/embedding_model/model.safetensors
+models/vosk-model-small-en-us-0.15/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+# Databases & Vector Indexes
+database/*.db
+database/*.index
+database/*.pkl
+database/memory.db
+database/faiss.index
+database/id_map.pkl
+
+# Temporary audio & logs
+*.wav
+*.mp3
+*.webm
+temp.wav
+*.log
+
+# Environment & IDE
+.env
+.vscode/
+.idea/

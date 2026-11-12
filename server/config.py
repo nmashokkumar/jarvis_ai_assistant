@@ -28,6 +28,10 @@ class Config:
     LOCATION_DEFAULT: str = os.getenv("LOCATION_DEFAULT", "Chennai, India")
 
     # ── TTS ───────────────────────────────────────────────────────────────────
+    TTS_ENGINE: str = os.getenv("TTS_ENGINE", "kokoro")  # "kokoro" | "edge"
+    KOKORO_VOICE: str = os.getenv("KOKORO_VOICE", "af_heart")
+    KOKORO_MODEL_PATH: str = os.getenv("KOKORO_MODEL_PATH", "/opt/jarvis/models/kokoro-v1.0.onnx")
+    KOKORO_VOICES_PATH: str = os.getenv("KOKORO_VOICES_PATH", "/opt/jarvis/models/voices-v1.0.bin")
     TTS_VOICE: str = os.getenv("TTS_VOICE", "en-IN-PrabhatNeural")
 
 
