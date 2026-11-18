@@ -101,6 +101,64 @@ class ChatEngine:
 
         return messages
 
+    async def _resolve_search_query(
+        self,
+        conversation_id: str,
+        user_message: str,
+        extracted_query: Optional[str] = None,
+    ) -> str:
+        """
+        Approach 2: Contextual LLM Query Rewriter.
+        Uses conversation history + LLM tool calling to rewrite pronouns ('it', 'that', 'he')
+        into an accurate DuckDuckGo search query.
+        """
+        words = user_message.strip().split()
+        pronouns = {"it", "that", "this", "he", "she", "him", "her", "they", "them", "there", "what"}
+        has_pronoun = any(w.lower().strip("?.!,") in pronouns for w in words)
+        is_short_followup = len(words) <= 4
+
+        history = await self.db.get_messages(conversation_id, limit=6)
+
+        if history and (has_pronoun or is_short_followup or not extracted_query):
+            history_messages: list[dict] = []
+            for m in history[-4:]:
+                if m["role"] == "user" and m["content"] == user_message:
+                    continue
+                history_messages.append({"role": m["role"], "content": m["content"]})
+            history_messages.append({"role": "user", "content": user_message})
+
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "Search the live web for facts, people, or news",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": "The exact search query keywords with all pronouns like it or that replaced by the actual topic from the conversation history.",
+                                }
+                            },
+                            "required": ["query"],
+                        },
+                    },
+                }
+            ]
+
+            try:
+                res = await self.llm.call_with_tools(history_messages, tools)
+                if res and "tool_calls" in res and res["tool_calls"]:
+                    resolved = res["tool_calls"][0].get("function", {}).get("arguments", {}).get("query")
+                    if resolved and resolved.strip():
+                        logger.info("LLM query rewrite resolved: %r -> %r", user_message, resolved.strip())
+                        return resolved.strip()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("LLM query rewrite failed: %s", exc)
+
+        return extracted_query or user_message
+
     # ─────────────────────────────────────────────────────────────────────────
     # Non-streaming
     # ─────────────────────────────────────────────────────────────────────────
@@ -129,6 +187,11 @@ class ChatEngine:
         tool_result: Optional[str] = None
 
         if tool_name:
+            if tool_name == "web_search":
+                tool_params["query"] = await self._resolve_search_query(
+                    conversation_id, user_message, tool_params.get("query")
+                )
+
             try:
                 tool_result = await execute_tool(tool_name, tool_params, user_message, self.db)
             except Exception as exc:  # noqa: BLE001
@@ -192,6 +255,11 @@ class ChatEngine:
         tool_result: Optional[str] = None
 
         if tool_name:
+            if tool_name == "web_search":
+                tool_params["query"] = await self._resolve_search_query(
+                    conversation_id, user_message, tool_params.get("query")
+                )
+
             try:
                 tool_result = await execute_tool(tool_name, tool_params, user_message, self.db)
             except Exception as exc:  # noqa: BLE001

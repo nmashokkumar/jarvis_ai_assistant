@@ -138,6 +138,36 @@ class OllamaClient:
             yield f"Boss, the AI backend hit an error: {exc}"
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Tool Calling / Query Rewriter (Approach 2)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def call_with_tools(
+        self, messages: List[dict], tools: List[dict]
+    ) -> Optional[dict]:
+        """
+        Invoke Ollama with native tool specifications to resolve search queries / anaphora.
+        Returns the raw message dict containing tool_calls if emitted.
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "stream": False,
+            "options": {
+                "num_predict": 35,
+                "temperature": 0.1,
+                "num_thread": 4,
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                r = await client.post(f"{self.base_url}/api/chat", json=payload)
+                r.raise_for_status()
+                return r.json().get("message", {})
+        except Exception as exc:  # noqa: BLE001
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Health check
     # ─────────────────────────────────────────────────────────────────────────
 

@@ -47,6 +47,7 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
         "new todo", "create todo", "create task",
     ],
     "web_search": [
+        "search it", "search that", "look it up", "google it", "check it", "check that", "find it",
         "search for", "search", "look up", "google", "find out",
         "what is", "what are", "what does", "who is", "who are", "where is",
         "when did", "when is", "how much", "price of", "cost of",
