@@ -22,6 +22,12 @@ jarvis.db
 *.wav
 *.mp3
 
+# Model binaries & GGUF files
+*.gguf
+*.bin
+*.onnx
+models/
+
 # Deployment bundles
 jarvis_deploy.tar.gz
 test_server_chat.py

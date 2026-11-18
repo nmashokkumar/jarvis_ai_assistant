@@ -36,10 +36,17 @@ class OllamaClient:
                 "num_predict": settings.OLLAMA_NUM_PREDICT,
                 "temperature": settings.OLLAMA_TEMPERATURE,
                 "num_thread": 4,   # Utilize all 4 CPU cores for maximum inference speed
-                "num_ctx": 2048,   # Optimized context window for 2x faster CPU processing
-                "top_k": 30,
-                "top_p": 0.9,
-                "stop": ["<|im_end|>", "</s>"],
+                "num_ctx": 8192,   # Expanded context window for deep brainstorming and chat
+                "top_p": 0.90,
+                "min_p": 0.06,
+                "repeat_penalty": 1.12,
+                "stop": [
+                    "<|eot_id|>",
+                    "<|start_header_id|>",
+                    "<|end_header_id|>",
+                    "<|im_end|>",
+                    "</s>",
+                ],
             },
         }
 

@@ -11,9 +11,9 @@ load_dotenv()
 class Config:
     # ── Ollama ────────────────────────────────────────────────────────────────
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-    OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "300"))
-    OLLAMA_TEMPERATURE: float = float(os.getenv("OLLAMA_TEMPERATURE", "0.7"))
+    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "jarvis")
+    OLLAMA_NUM_PREDICT: int = int(os.getenv("OLLAMA_NUM_PREDICT", "100"))
+    OLLAMA_TEMPERATURE: float = float(os.getenv("OLLAMA_TEMPERATURE", "0.62"))
 
     # ── Database ──────────────────────────────────────────────────────────────
     DB_PATH: str = os.getenv("DB_PATH", "/opt/jarvis/jarvis.db")
@@ -21,8 +21,8 @@ class Config:
     # ── Auth ──────────────────────────────────────────────────────────────────
     SECRET_TOKEN: str = os.getenv("SECRET_TOKEN", "jarvis-secret-change-me")
 
-    # ── Conversation ──────────────────────────────────────────────────────────
-    MAX_CONTEXT_MESSAGES: int = int(os.getenv("MAX_CONTEXT_MESSAGES", "20"))
+    # ── Conversation & Brainstorming Context ───────────────────────────────────
+    MAX_CONTEXT_MESSAGES: int = int(os.getenv("MAX_CONTEXT_MESSAGES", "50"))
 
     # ── Defaults ──────────────────────────────────────────────────────────────
     LOCATION_DEFAULT: str = os.getenv("LOCATION_DEFAULT", "Chennai, India")
