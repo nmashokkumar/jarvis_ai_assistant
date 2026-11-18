@@ -13,9 +13,21 @@ if TYPE_CHECKING:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Intent → keyword mapping
+# Ordered by priority (system monitor / reminders / weather / calendar / notes before generic search)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _INTENT_KEYWORDS: dict[str, list[str]] = {
+    "system_monitor": [
+        "system status", "server status", "server health", "system health",
+        "server systems", "are all server systems", "server diagnostic", "system diagnostic",
+        "diagnostics", "check server", "check the server", "server check",
+        "system check", "check system", "check systems", "how is the server",
+        "how's the server", "cpu usage", "how much cpu", "cpu load",
+        "ram usage", "memory usage", "how much ram", "memory load",
+        "disk space", "disk usage", "storage space", "storage status",
+        "free disk", "free storage", "server uptime", "system uptime",
+        "hardware status", "server metrics",
+    ],
     "reminder": [
         "remind me", "set a reminder", "set reminder", "alarm",
         "remind at", "remind in", "set an alarm",
@@ -24,23 +36,31 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
         "weather", "temperature", "forecast", "humidity", "rain",
         "is it raining", "how hot", "how cold", "climate",
     ],
-    "web_search": [
-        "search", "look up", "look up", "google", "find out",
-        "what is", "what are", "who is", "who are", "where is",
-        "when did", "when is", "how much", "price of", "cost of",
-        "latest news", "news about", "tell me about",
+    "calendar": [
+        "add event", "schedule", "schedule a meeting", "add to calendar",
+        "create event", "new event", "calendar event", "set a meeting",
+        "book a meeting",
     ],
     "notes": [
         "add a note", "make a note", "save a note", "note that",
         "add todo", "add to do", "add task", "add to list",
         "new todo", "create todo", "create task",
     ],
-    "calendar": [
-        "add event", "schedule", "schedule a meeting", "add to calendar",
-        "create event", "new event", "calendar event", "set a meeting",
-        "book a meeting",
+    "web_search": [
+        "search for", "search", "look up", "google", "find out",
+        "what is", "what are", "who is", "who are", "where is",
+        "when did", "when is", "how much", "price of", "cost of",
+        "latest news", "news about", "tell me about",
     ],
 }
+
+# Questions or conversational phrases that should NOT trigger action tools
+_NEGATIVE_PATTERNS = [
+    "who are you", "who am i", "what is your name", "what can you do",
+    "how are you", "hello", "hey jarvis", "hi jarvis", "tell me a joke",
+    "what is a reminder", "how to set a reminder", "what is a calendar",
+    "how do calendars work", "how do reminders work",
+]
 
 
 def detect_tool(message: str) -> Tuple[Optional[str], dict]:
@@ -51,14 +71,10 @@ def detect_tool(message: str) -> Tuple[Optional[str], dict]:
     Returns:
         (tool_name, params_dict) — tool_name is None if no tool matched.
     """
-    lower = message.lower()
+    lower = message.lower().strip()
 
-    # Do not trigger web search for conversational self-referential questions
-    conversational_patterns = [
-        "who are you", "who am i", "what is your name", "what can you do",
-        "how are you", "hello", "hey jarvis", "hi jarvis", "tell me a joke"
-    ]
-    for cp in conversational_patterns:
+    # Do not trigger tools for purely conversational / meta questions
+    for cp in _NEGATIVE_PATTERNS:
         if cp in lower:
             return None, {}
 
@@ -73,7 +89,7 @@ def detect_tool(message: str) -> Tuple[Optional[str], dict]:
 
 def _extract_params(tool_name: str, raw: str, lower: str) -> dict:
     """
-    Minimal param extraction from raw text.  Tools do their own heavier
+    Minimal param extraction from raw text. Tools do their own heavier
     parsing internally; we just surface obvious fields here so the router
     can pass them on.
     """
@@ -95,6 +111,18 @@ def _extract_params(tool_name: str, raw: str, lower: str) -> dict:
             query = pattern.sub("", query)
         params["query"] = query.strip().rstrip("?.")
 
+    elif tool_name == "system_monitor":
+        if any(w in lower for w in ["cpu", "processor"]):
+            params["aspect"] = "cpu"
+        elif any(w in lower for w in ["ram", "memory"]):
+            params["aspect"] = "ram"
+        elif any(w in lower for w in ["disk", "storage", "space", "hard drive"]):
+            params["aspect"] = "disk"
+        elif any(w in lower for w in ["uptime", "boot"]):
+            params["aspect"] = "uptime"
+        else:
+            params["aspect"] = "all"
+
     return params
 
 
@@ -112,7 +140,7 @@ async def execute_tool(
     Dispatch to the appropriate tool function and return its result string.
 
     Args:
-        tool_name: one of 'reminder', 'weather', 'web_search', 'notes', 'calendar'
+        tool_name: one of 'system_monitor', 'reminder', 'weather', 'web_search', 'notes', 'calendar'
         params: extracted parameters from detect_tool()
         user_message: original raw message (passed to tools that need NLP)
         db: active DatabaseManager
@@ -120,7 +148,13 @@ async def execute_tool(
     Returns:
         Human-readable result string.
     """
-    if tool_name == "weather":
+    if tool_name == "system_monitor":
+        from tools.system_monitor import get_system_metrics
+
+        aspect = params.get("aspect", "all")
+        return await get_system_metrics(aspect)
+
+    elif tool_name == "weather":
         from tools.weather import get_weather
         from config import settings
 

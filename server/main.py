@@ -209,6 +209,34 @@ async def health() -> Dict[str, Any]:
     return {"status": "ok", "model": settings.OLLAMA_MODEL}
 
 
+@app.get("/api/system/status", dependencies=[Depends(require_auth)])
+async def system_status_api() -> Dict[str, Any]:
+    """Return JSON system metrics and hardware stats."""
+    from tools.system_monitor import get_system_status
+    import psutil, time
+    cpu = psutil.cpu_percent(interval=None)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    uptime = time.time() - psutil.boot_time()
+    return {
+        "status": "ok",
+        "cpu_percent": cpu,
+        "ram": {
+            "total_gb": round(mem.total / (1024**3), 2),
+            "used_gb": round(mem.used / (1024**3), 2),
+            "percent": mem.percent,
+        },
+        "disk": {
+            "total_gb": round(disk.total / (1024**3), 2),
+            "free_gb": round(disk.free / (1024**3), 2),
+            "percent": disk.percent,
+        },
+        "uptime_seconds": int(uptime),
+        "summary": get_system_status(),
+    }
+
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Chat (REST)
 # ─────────────────────────────────────────────────────────────────────────────

@@ -69,8 +69,13 @@ def format_tool_result(tool_name: str, result: str) -> str:
     """
     Wraps external tool results so the LLM knows how to summarise them in plain English.
     """
+    if tool_name == "system_monitor":
+        instruction = "Report the real server metrics (CPU, RAM, storage, uptime) clearly and accurately in 1-2 sharp sentences for Boss. Do not invent any fake warnings."
+    else:
+        instruction = "Summarise this in 1-2 simple sentences for Boss. Do not read raw code or technical logs."
+
     return (
         f"[System Information from {tool_name}]:\n"
         f"{result}\n"
-        "[Summarise this in 1-2 simple sentences for Boss. Do not read raw code or technical logs.]"
+        f"[{instruction}]"
     )
