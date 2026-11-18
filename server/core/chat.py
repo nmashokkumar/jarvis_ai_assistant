@@ -117,14 +117,22 @@ class ChatEngine:
         has_pronoun = any(w.lower().strip("?.!,") in pronouns for w in words)
         is_short_followup = len(words) <= 4
 
+        conversational_starters = (
+            "do you know", "have you heard", "can you tell", "tell me", "what is",
+            "what are", "who is", "who was", "where is", "when did", "search", "check",
+            "how to", "how does", "is there", "are there"
+        )
+        is_conversational = any(user_message.lower().strip().startswith(p) for p in conversational_starters)
+
         history = await self.db.get_messages(conversation_id, limit=6)
 
-        if history and (has_pronoun or is_short_followup or not extracted_query):
+        if has_pronoun or is_short_followup or is_conversational or not extracted_query:
             history_messages: list[dict] = []
-            for m in history[-4:]:
-                if m["role"] == "user" and m["content"] == user_message:
-                    continue
-                history_messages.append({"role": m["role"], "content": m["content"]})
+            if history:
+                for m in history[-4:]:
+                    if m["role"] == "user" and m["content"] == user_message:
+                        continue
+                    history_messages.append({"role": m["role"], "content": m["content"]})
             history_messages.append({"role": "user", "content": user_message})
 
             tools = [

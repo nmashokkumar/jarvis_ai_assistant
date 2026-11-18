@@ -67,6 +67,48 @@ _NEGATIVE_PATTERNS = [
 ]
 
 
+def _should_auto_search(raw: str, lower: str) -> bool:
+    """
+    Detect whether a question asks about concepts, acronyms, entities, or real-time topics
+    even without explicit 'search' keywords.
+    """
+    # 1. Informational question triggers
+    info_prefixes = [
+        "do you know", "have you heard", "tell me about", "what is", "what are",
+        "what does", "who is", "who was", "who are", "can you explain", "explain",
+        "how does", "how do", "where is", "when did", "when was", "meaning of",
+        "definition of", "how to"
+    ]
+    if any(prefix in lower for prefix in info_prefixes):
+        return True
+
+    # 2. Tech acronyms / uppercase terms (e.g. MCP, RAG, DSPY, LLM, VLLM, LORA, GGUF, CUDA, API)
+    raw_tokens = re.findall(r"\b[A-Z]{2,6}\b", raw)
+    acronyms = [t for t in raw_tokens if t not in {"OK", "AM", "PM", "AI", "I"}]
+    if acronyms:
+        return True
+
+    # 3. Known tech companies / models / platforms
+    entities = [
+        "claude", "anthropic", "openai", "chatgpt", "gemini", "deepseek", "nvidia",
+        "llama", "mistral", "qwen", "groq", "huggingface", "pytorch", "vllm", "unsloth",
+        "apple", "google", "microsoft", "meta", "tesla", "github"
+    ]
+    if any(ent in lower for ent in entities):
+        return True
+
+    # 4. Temporal & live data triggers (with typo tolerance)
+    live_markers = [
+        "stock", "price", "prive", "share", "market", "score", "match", "winner",
+        "election", "yesterday", "yesteday", "today", "tomorrow", "tonight", "latest",
+        "recent", "current", "newest", "released", "launch"
+    ]
+    if any(marker in lower for marker in live_markers):
+        return True
+
+    return False
+
+
 def detect_tool(message: str) -> Tuple[Optional[str], dict]:
     """
     Scan `message` for known intent keywords and return the matching tool name
@@ -82,11 +124,17 @@ def detect_tool(message: str) -> Tuple[Optional[str], dict]:
         if cp in lower:
             return None, {}
 
+    # Check high-priority explicit tools first (system monitor, reminder, weather, calendar, notes)
     for tool_name, keywords in _INTENT_KEYWORDS.items():
         for kw in keywords:
             if kw in lower:
                 params = _extract_params(tool_name, message, lower)
                 return tool_name, params
+
+    # Auto-detect informational questions, tech acronyms, entities, or live data
+    if _should_auto_search(message, lower):
+        params = _extract_params("web_search", message, lower)
+        return "web_search", params
 
     return None, {}
 
