@@ -222,7 +222,16 @@ async def execute_tool(
         from tools.web_search import search_web
 
         query = params.get("query") or user_message
-        return await search_web(query)
+        category = params.get("category", "text")
+        timelimit = params.get("timelimit")
+        region = params.get("region", "in-en")
+        return await search_web(
+            query,
+            category=category,
+            timelimit=timelimit,
+            region=region,
+            db=db,
+        )
 
     elif tool_name == "reminder":
         from tools.reminder import handle_reminder_intent

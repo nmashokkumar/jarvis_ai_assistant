@@ -92,9 +92,19 @@ CREATE_TABLES_SQL = [
     )
     """,
 
+    # ── Search Cache ──────────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS search_cache (
+        cache_key   TEXT PRIMARY KEY,
+        result      TEXT NOT NULL,
+        expires_at  REAL NOT NULL
+    )
+    """,
+
     # ── Indexes ───────────────────────────────────────────────────────────────
     "CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)",
     "CREATE INDEX IF NOT EXISTS idx_reminders_active ON reminders(is_active, remind_at)",
     "CREATE INDEX IF NOT EXISTS idx_notes_category ON notes(category)",
     "CREATE INDEX IF NOT EXISTS idx_events_start ON calendar_events(start_time)",
+    "CREATE INDEX IF NOT EXISTS idx_search_cache_expires ON search_cache(expires_at)",
 ]

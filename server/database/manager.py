@@ -336,3 +336,29 @@ class DatabaseManager:
     async def get_all_settings(self) -> dict:
         rows = await self._fetchall("SELECT key, value FROM settings")
         return {r["key"]: r["value"] for r in rows}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Search Cache (TTL)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def get_cached_search(self, cache_key: str) -> Optional[str]:
+        import time
+        row = await self._fetchone(
+            "SELECT result FROM search_cache WHERE cache_key = ? AND expires_at > ?",
+            (cache_key, time.time()),
+        )
+        return row["result"] if row else None
+
+    async def save_cached_search(self, cache_key: str, result: str, ttl_seconds: int = 900) -> None:
+        import time
+        expires_at = time.time() + ttl_seconds
+        await self._execute(
+            """
+            INSERT INTO search_cache (cache_key, result, expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                result = excluded.result,
+                expires_at = excluded.expires_at
+            """,
+            (cache_key, result, expires_at),
+        )

@@ -106,66 +106,74 @@ class ChatEngine:
         conversation_id: str,
         user_message: str,
         extracted_query: Optional[str] = None,
-    ) -> str:
+    ) -> dict:
         """
-        Approach 2: Contextual LLM Query Rewriter.
-        Uses conversation history + LLM tool calling to rewrite pronouns ('it', 'that', 'he')
-        into an accurate DuckDuckGo search query.
+        Contextual LLM Query Rewriter with dual-mode (news vs text) and timelimits.
+        Returns a dict: {"query": ..., "category": ..., "timelimit": ...}
         """
-        words = user_message.strip().split()
-        pronouns = {"it", "that", "this", "he", "she", "him", "her", "they", "them", "there", "what"}
-        has_pronoun = any(w.lower().strip("?.!,") in pronouns for w in words)
-        is_short_followup = len(words) <= 4
-
-        conversational_starters = (
-            "do you know", "have you heard", "can you tell", "tell me", "what is",
-            "what are", "who is", "who was", "where is", "when did", "search", "check",
-            "how to", "how does", "is there", "are there"
-        )
-        is_conversational = any(user_message.lower().strip().startswith(p) for p in conversational_starters)
-
         history = await self.db.get_messages(conversation_id, limit=6)
 
-        if has_pronoun or is_short_followup or is_conversational or not extracted_query:
-            history_messages: list[dict] = []
-            if history:
-                for m in history[-4:]:
-                    if m["role"] == "user" and m["content"] == user_message:
-                        continue
-                    history_messages.append({"role": m["role"], "content": m["content"]})
-            history_messages.append({"role": "user", "content": user_message})
+        resolved_dict = {
+            "query": extracted_query or user_message,
+            "category": "text",
+            "timelimit": None,
+        }
 
-            tools = [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "web_search",
-                        "description": "Search the live web for facts, people, or news",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "description": "The exact search query keywords with all pronouns like it or that replaced by the actual topic from the conversation history.",
-                                }
+        history_messages: list[dict] = []
+        if history:
+            for m in history[-4:]:
+                if m["role"] == "user" and m["content"] == user_message:
+                    continue
+                history_messages.append({"role": m["role"], "content": m["content"]})
+        history_messages.append({"role": "user", "content": user_message})
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the live web or news for facts, people, or events",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Clean, standalone search keywords with all pronouns replaced by the real topic from conversation.",
                             },
-                            "required": ["query"],
+                            "category": {
+                                "type": "string",
+                                "enum": ["news", "text"],
+                                "description": "Use 'news' for current events, stock prices, match scores, breaking news, or today/yesterday queries. Use 'text' for technical concepts, definitions, and documentation.",
+                            },
+                            "timelimit": {
+                                "type": "string",
+                                "enum": ["d", "w", "none"],
+                                "description": "Pass 'd' for past day (today/yesterday queries), 'w' for past week, or 'none' for timeless technical facts.",
+                            },
                         },
+                        "required": ["query"],
                     },
-                }
-            ]
+                },
+            }
+        ]
 
-            try:
-                res = await self.llm.call_with_tools(history_messages, tools)
-                if res and "tool_calls" in res and res["tool_calls"]:
-                    resolved = res["tool_calls"][0].get("function", {}).get("arguments", {}).get("query")
-                    if resolved and resolved.strip():
-                        logger.info("LLM query rewrite resolved: %r -> %r", user_message, resolved.strip())
-                        return resolved.strip()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("LLM query rewrite failed: %s", exc)
+        try:
+            res = await self.llm.call_with_tools(history_messages, tools)
+            if res and "tool_calls" in res and res["tool_calls"]:
+                args = res["tool_calls"][0].get("function", {}).get("arguments", {})
+                if args.get("query"):
+                    resolved_dict["query"] = args["query"].strip()
+                if args.get("category"):
+                    resolved_dict["category"] = args["category"]
+                if args.get("timelimit") and args["timelimit"] != "none":
+                    resolved_dict["timelimit"] = args["timelimit"]
 
-        return extracted_query or user_message
+                logger.info("LLM query rewrite resolved: %r -> %s", user_message, resolved_dict)
+                return resolved_dict
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("LLM query rewrite failed: %s", exc)
+
+        return resolved_dict
 
     # ─────────────────────────────────────────────────────────────────────────
     # Non-streaming
@@ -196,9 +204,12 @@ class ChatEngine:
 
         if tool_name:
             if tool_name == "web_search":
-                tool_params["query"] = await self._resolve_search_query(
+                resolved_info = await self._resolve_search_query(
                     conversation_id, user_message, tool_params.get("query")
                 )
+                tool_params["query"] = resolved_info["query"]
+                tool_params["category"] = resolved_info.get("category", "text")
+                tool_params["timelimit"] = resolved_info.get("timelimit")
 
             try:
                 tool_result = await execute_tool(tool_name, tool_params, user_message, self.db)
@@ -264,9 +275,12 @@ class ChatEngine:
 
         if tool_name:
             if tool_name == "web_search":
-                tool_params["query"] = await self._resolve_search_query(
+                resolved_info = await self._resolve_search_query(
                     conversation_id, user_message, tool_params.get("query")
                 )
+                tool_params["query"] = resolved_info["query"]
+                tool_params["category"] = resolved_info.get("category", "text")
+                tool_params["timelimit"] = resolved_info.get("timelimit")
 
             try:
                 tool_result = await execute_tool(tool_name, tool_params, user_message, self.db)
