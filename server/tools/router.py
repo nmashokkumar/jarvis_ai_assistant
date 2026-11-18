@@ -48,16 +48,19 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
     ],
     "web_search": [
         "search for", "search", "look up", "google", "find out",
-        "what is", "what are", "who is", "who are", "where is",
+        "what is", "what are", "what does", "who is", "who are", "where is",
         "when did", "when is", "how much", "price of", "cost of",
-        "latest news", "news about", "tell me about",
+        "latest news", "news about", "current news", "tell me about",
+        "explain", "meaning of", "definition of", "define",
     ],
 }
 
 # Questions or conversational phrases that should NOT trigger action tools
 _NEGATIVE_PATTERNS = [
-    "who are you", "who am i", "what is your name", "what can you do",
+    "who are you", "who am i", "what is your name", "what's your name",
+    "what is my name", "what's my name", "what can you do", "what are you",
     "how are you", "hello", "hey jarvis", "hi jarvis", "tell me a joke",
+    "are you real", "are you human", "who made you", "who created you",
     "what is a reminder", "how to set a reminder", "what is a calendar",
     "how do calendars work", "how do reminders work",
 ]
@@ -101,15 +104,20 @@ def _extract_params(tool_name: str, raw: str, lower: str) -> dict:
         params["location"] = m.group(1).strip() if m else None
 
     elif tool_name == "web_search":
-        # Strip common prefixes to get the actual query
-        query = raw
+        # Strip wake-word prefixes if user addressed Jarvis directly
+        query = re.sub(r"^(hey\s+)?jarvis[,:\s]*", "", raw, flags=re.IGNORECASE)
+
+        # Strip common search command prefixes to get the actual clean query
         for prefix in [
-            "search for", "search", "look up", "google", "find out about",
-            "what is", "who is", "how much is", "price of", "tell me about",
+            "search for", "search", "look up", "google", "find out about", "find out",
+            "what is", "what are", "what does", "who is", "who are", "where is",
+            "how much is", "price of", "cost of", "tell me about", "explain",
+            "meaning of", "definition of", "define",
         ]:
             pattern = re.compile(rf"^\s*{re.escape(prefix)}\s+", re.IGNORECASE)
             query = pattern.sub("", query)
-        params["query"] = query.strip().rstrip("?.")
+        clean_query = query.strip().rstrip("?.")
+        params["query"] = clean_query if clean_query else raw
 
     elif tool_name == "system_monitor":
         if any(w in lower for w in ["cpu", "processor"]):

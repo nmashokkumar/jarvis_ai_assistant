@@ -26,14 +26,17 @@ class OllamaClient:
         self.model = settings.OLLAMA_MODEL
         self.timeout = httpx.Timeout(120.0, connect=10.0)
 
-    def _build_payload(self, messages: List[dict], stream: bool) -> dict:
+    def _build_payload(
+        self, messages: List[dict], stream: bool, num_predict: Optional[int] = None
+    ) -> dict:
+        tokens = num_predict or settings.OLLAMA_NUM_PREDICT
         return {
             "model": self.model,
             "messages": messages,
             "stream": stream,
             "keep_alive": "24h",  # Pin model in RAM permanently — zero reload delay!
             "options": {
-                "num_predict": settings.OLLAMA_NUM_PREDICT,
+                "num_predict": tokens,
                 "temperature": settings.OLLAMA_TEMPERATURE,
                 "num_thread": 4,   # Utilize all 4 CPU cores for maximum inference speed
                 "num_ctx": 8192,   # Expanded context window for deep brainstorming and chat
@@ -54,7 +57,9 @@ class OllamaClient:
     # Non-streaming
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def chat(self, messages: List[dict], mode: str = "regular") -> str:
+    async def chat(
+        self, messages: List[dict], mode: str = "regular", num_predict: Optional[int] = None
+    ) -> str:
         """
         Send a full conversation and return the assistant reply as a string.
 
@@ -62,11 +67,12 @@ class OllamaClient:
             messages: list of {"role": ..., "content": ...} dicts
             mode: 'regular' or 'productivity' (unused at HTTP level but kept
                   for future per-mode parameter tuning)
+            num_predict: optional dynamic token budget limit
 
         Returns:
             Assistant response text.
         """
-        payload = self._build_payload(messages, stream=False)
+        payload = self._build_payload(messages, stream=False, num_predict=num_predict)
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 response = await client.post(
@@ -91,7 +97,7 @@ class OllamaClient:
     # ─────────────────────────────────────────────────────────────────────────
 
     async def chat_stream(
-        self, messages: List[dict], mode: str = "regular"
+        self, messages: List[dict], mode: str = "regular", num_predict: Optional[int] = None
     ) -> AsyncGenerator[str, None]:
         """
         Stream token chunks from Ollama as they arrive.
@@ -99,7 +105,7 @@ class OllamaClient:
         Yields:
             Individual token strings (may be empty — callers should filter).
         """
-        payload = self._build_payload(messages, stream=True)
+        payload = self._build_payload(messages, stream=True, num_predict=num_predict)
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 async with client.stream(

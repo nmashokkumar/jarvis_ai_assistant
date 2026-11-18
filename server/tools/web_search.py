@@ -16,7 +16,10 @@ _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ddgs")
 
 def _sync_search(query: str, max_results: int = 3) -> list[dict]:
     """Run DuckDuckGo search synchronously (called from a thread)."""
-    from duckduckgo_search import DDGS
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
 
     with DDGS() as ddgs:
         return list(ddgs.text(query, max_results=max_results))

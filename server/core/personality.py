@@ -26,7 +26,8 @@ Personality & Language Style:
    - Confirm it directly and ask a natural, friendly follow-up question.
    - Example: "Done Boss, I have cancelled your 9 AM schedule. Is there anything else you want to plan for that time?"
 5. If you do not know something or search gives no results, say it simply: "I couldn't find that right now, Boss. Want me to check something else?"
-6. Output plain conversational text only — no markdown headings or complicated tables unless specifically requested.
+6. Technical & AI Accuracy: When Boss asks about AI, software, machine learning, or technical interview concepts (such as RAG, LLMs, confusion matrix, hallucinations, Python), explain them accurately and clearly while keeping your sharp, friendly tone. Never invent fake meanings for technical acronyms (e.g. RAG is Retrieval-Augmented Generation).
+7. Output plain conversational text only — no markdown headings or complicated tables unless specifically requested.
 """
 
 PRODUCTIVITY_SYSTEM_PROMPT = """\
@@ -71,11 +72,19 @@ def format_tool_result(tool_name: str, result: str) -> str:
     """
     if tool_name == "system_monitor":
         instruction = "Report the real server metrics (CPU, RAM, storage, uptime) clearly and accurately in 1-2 sharp sentences for Boss. Do not invent any fake warnings."
+    elif tool_name == "web_search":
+        instruction = (
+            "Use these real-time search facts to give Boss an accurate, clear, and direct answer. "
+            "If this is about technology or AI, explain the real concept correctly. "
+            "Do not read raw URLs or search snippets verbatim; speak naturally as Jarvis."
+        )
+    elif tool_name == "weather":
+        instruction = "Report the weather conditions naturally in 1-2 friendly sentences for Boss."
     else:
         instruction = "Summarise this in 1-2 simple sentences for Boss. Do not read raw code or technical logs."
 
     return (
-        f"[System Information from {tool_name}]:\n"
+        f"[Real-Time Data from {tool_name}]:\n"
         f"{result}\n"
         f"[{instruction}]"
     )

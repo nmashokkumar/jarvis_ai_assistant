@@ -18,6 +18,28 @@ from tools.router import detect_tool, execute_tool
 logger = logging.getLogger(__name__)
 
 
+def calculate_num_predict(user_message: str, tool_name: Optional[str] = None) -> int:
+    """
+    Dynamically select token budget:
+    - 100 tokens for quick conversational banter and snappy voice responses.
+    - 250 tokens when real-time search data, long questions, or technical explanations are needed.
+    """
+    if tool_name:
+        return 250
+    words = len(user_message.split())
+    if words >= 12:
+        return 250
+    deep_triggers = [
+        "explain", "interview", "difference", "compare", "how to", "why",
+        "detail", "steps", "guide", "advice", "teach", "summarize", "tell me about",
+        "what is", "what are", "what does", "meaning", "define", "rag", "llm"
+    ]
+    lower = user_message.lower()
+    if any(k in lower for k in deep_triggers):
+        return 250
+    return 100
+
+
 class ChatEngine:
     """
     Orchestrates a full chat turn:
@@ -118,8 +140,9 @@ class ChatEngine:
             conversation_id, user_message, mode, tool_name, tool_result
         )
 
-        # LLM call
-        response = await self.llm.chat(messages, mode)
+        # LLM call with dynamic token budget
+        num_predict = calculate_num_predict(user_message, tool_name)
+        response = await self.llm.chat(messages, mode, num_predict=num_predict)
 
         # Persist assistant reply
         await self.db.save_message(
@@ -180,9 +203,10 @@ class ChatEngine:
             conversation_id, user_message, mode, tool_name, tool_result
         )
 
-        # Stream and collect
+        # Stream and collect with dynamic token budget
+        num_predict = calculate_num_predict(user_message, tool_name)
         full_response_parts: list[str] = []
-        async for token in self.llm.chat_stream(messages, mode):
+        async for token in self.llm.chat_stream(messages, mode, num_predict=num_predict):
             full_response_parts.append(token)
             yield token
 
