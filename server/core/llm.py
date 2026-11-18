@@ -1,48 +1,80 @@
 """
-Async Ollama client for JARVIS.
-Supports both blocking and streaming inference via httpx.
+Unified High-Performance LLM Client for JARVIS.
+Routes inference directly to C++ llama-server (OpenAI-compatible) for sub-millisecond
+dispatch, AVX2 SIMD acceleration, and prompt slot caching.
+Includes automatic zero-downtime fallback to Ollama.
 """
 from __future__ import annotations
 
 import json
-from typing import AsyncGenerator, List
+import logging
+from abc import ABC, abstractmethod
+from typing import AsyncGenerator, List, Optional
 
 import httpx
 
 from config import settings
 
+logger = logging.getLogger("jarvis.llm")
 
-class OllamaClient:
+
+class ILLMClient(ABC):
+    """Abstract interface defining the contract for JARVIS LLM services."""
+
+    @abstractmethod
+    async def chat(
+        self, messages: List[dict], mode: str = "regular", num_predict: Optional[int] = None
+    ) -> str:
+        """Non-streaming completion."""
+        ...
+
+    @abstractmethod
+    async def chat_stream(
+        self, messages: List[dict], mode: str = "regular", num_predict: Optional[int] = None
+    ) -> AsyncGenerator[str, None]:
+        """Streaming token-by-token generation."""
+        ...
+
+    @abstractmethod
+    async def call_with_tools(
+        self, messages: List[dict], tools: List[dict]
+    ) -> Optional[dict]:
+        """Tool/function calling for query rewriting and autonomous actions."""
+        ...
+
+    @abstractmethod
+    async def is_healthy(self) -> bool:
+        """Health check endpoint status."""
+        ...
+
+
+class LLMClient(ILLMClient):
     """
-    Thin async wrapper around the Ollama /api/chat endpoint.
-
-    Usage:
-        client = OllamaClient()
-        text = await client.chat(messages, mode="regular")
+    Production-grade LLM client orchestrating C++ llama-server with graceful Ollama fallback.
     """
 
     def __init__(self) -> None:
-        self.base_url = settings.OLLAMA_BASE_URL
-        self.model = settings.OLLAMA_MODEL
-        self.timeout = httpx.Timeout(120.0, connect=10.0)
+        self.llama_url = settings.LLAMA_CPP_BASE_URL.rstrip("/")
+        self.ollama_url = settings.OLLAMA_BASE_URL.rstrip("/")
+        self.ollama_model = settings.OLLAMA_MODEL
+        self.timeout = httpx.Timeout(120.0, connect=5.0)
 
-    def _build_payload(
-        self, messages: List[dict], stream: bool, num_predict: Optional[int] = None
-    ) -> dict:
+    # ─────────────────────────────────────────────────────────────────────────
+    # Non-streaming Chat
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def chat(
+        self, messages: List[dict], mode: str = "regular", num_predict: Optional[int] = None
+    ) -> str:
         tokens = num_predict or settings.OLLAMA_NUM_PREDICT
-        return {
-            "model": self.model,
-            "messages": messages,
-            "stream": stream,
-            "keep_alive": "24h",  # Pin model in RAM permanently — zero reload delay!
-            "options": {
-                "num_predict": tokens,
+
+        # 1. Primary: C++ llama-server (Direct native execution)
+        try:
+            payload = {
+                "messages": messages,
+                "max_tokens": tokens,
                 "temperature": settings.OLLAMA_TEMPERATURE,
-                "num_thread": 4,   # Utilize all 4 CPU cores for maximum inference speed
-                "num_ctx": 8192,   # Expanded context window for deep brainstorming and chat
                 "top_p": 0.90,
-                "min_p": 0.06,
-                "repeat_penalty": 1.12,
                 "stop": [
                     "<|eot_id|>",
                     "<|start_header_id|>",
@@ -50,68 +82,117 @@ class OllamaClient:
                     "<|im_end|>",
                     "</s>",
                 ],
+            }
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                res = await client.post(f"{self.llama_url}/chat/completions", json=payload)
+                if res.status_code == 200:
+                    data = res.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                logger.warning("llama-server returned HTTP %d, falling back to Ollama", res.status_code)
+        except Exception as exc:
+            logger.info("llama-server unavailable (%s), falling back to Ollama", exc)
+
+        # 2. Secondary: Ollama Fallback
+        return await self._chat_ollama(messages, tokens)
+
+    async def _chat_ollama(self, messages: List[dict], tokens: int) -> str:
+        payload = {
+            "model": self.ollama_model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "num_predict": tokens,
+                "temperature": settings.OLLAMA_TEMPERATURE,
+                "num_thread": 4,
             },
         }
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Non-streaming
-    # ─────────────────────────────────────────────────────────────────────────
-
-    async def chat(
-        self, messages: List[dict], mode: str = "regular", num_predict: Optional[int] = None
-    ) -> str:
-        """
-        Send a full conversation and return the assistant reply as a string.
-
-        Args:
-            messages: list of {"role": ..., "content": ...} dicts
-            mode: 'regular' or 'productivity' (unused at HTTP level but kept
-                  for future per-mode parameter tuning)
-            num_predict: optional dynamic token budget limit
-
-        Returns:
-            Assistant response text.
-        """
-        payload = self._build_payload(messages, stream=False, num_predict=num_predict)
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    f"{self.base_url}/api/chat",
-                    json=payload,
-                )
+                response = await client.post(f"{self.ollama_url}/api/chat", json=payload)
                 response.raise_for_status()
-                data = response.json()
-                return data["message"]["content"].strip()
-
+                return response.json()["message"]["content"].strip()
         except httpx.ConnectError:
-            return (
-                "Boss, Ollama seems to be offline. Fire it up and I'll be right with you."
-            )
+            return "Boss, both the C++ engine and Ollama seem to be offline."
         except httpx.TimeoutException:
             return "Boss, the model took too long to respond. Try a shorter question."
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             return f"Boss, something went sideways with the AI backend: {exc}"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Streaming
+    # Streaming Chat
     # ─────────────────────────────────────────────────────────────────────────
 
     async def chat_stream(
         self, messages: List[dict], mode: str = "regular", num_predict: Optional[int] = None
     ) -> AsyncGenerator[str, None]:
-        """
-        Stream token chunks from Ollama as they arrive.
+        tokens = num_predict or settings.OLLAMA_NUM_PREDICT
 
-        Yields:
-            Individual token strings (may be empty — callers should filter).
-        """
-        payload = self._build_payload(messages, stream=True, num_predict=num_predict)
+        # 1. Primary: C++ llama-server (SSE stream)
+        use_fallback = False
+        try:
+            payload = {
+                "messages": messages,
+                "max_tokens": tokens,
+                "temperature": settings.OLLAMA_TEMPERATURE,
+                "top_p": 0.90,
+                "stream": true if False else True,
+                "stop": [
+                    "<|eot_id|>",
+                    "<|start_header_id|>",
+                    "<|end_header_id|>",
+                    "<|im_end|>",
+                    "</s>",
+                ],
+            }
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                async with client.stream(
+                    "POST", f"{self.llama_url}/chat/completions", json=payload
+                ) as response:
+                    if response.status_code == 200:
+                        async for line in response.aiter_lines():
+                            line_str = line.strip()
+                            if not line_str or not line_str.startswith("data: "):
+                                continue
+                            data_str = line_str[6:].strip()
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                token = delta.get("content", "")
+                                if token:
+                                    yield token
+                            except Exception:
+                                continue
+                        return
+                    else:
+                        use_fallback = True
+        except Exception as exc:
+            logger.info("llama-server stream error (%s), using Ollama fallback", exc)
+            use_fallback = True
+
+        # 2. Secondary: Ollama Streaming Fallback
+        if use_fallback:
+            async for token in self._chat_stream_ollama(messages, tokens):
+                yield token
+
+    async def _chat_stream_ollama(
+        self, messages: List[dict], tokens: int
+    ) -> AsyncGenerator[str, None]:
+        payload = {
+            "model": self.ollama_model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "num_predict": tokens,
+                "temperature": settings.OLLAMA_TEMPERATURE,
+                "num_thread": 4,
+            },
+        }
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 async with client.stream(
-                    "POST",
-                    f"{self.base_url}/api/chat",
-                    json=payload,
+                    "POST", f"{self.ollama_url}/api/chat", json=payload
                 ) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
@@ -119,65 +200,105 @@ class OllamaClient:
                             continue
                         try:
                             chunk = json.loads(line)
-                        except json.JSONDecodeError:
+                            token = chunk.get("message", {}).get("content", "")
+                            if token:
+                                yield token
+                            if chunk.get("done", False):
+                                break
+                        except Exception:
                             continue
-
-                        token = chunk.get("message", {}).get("content", "")
-                        if token:
-                            yield token
-
-                        # Ollama signals end-of-stream with done=true
-                        if chunk.get("done", False):
-                            break
-
         except httpx.ConnectError:
-            yield "Boss, Ollama seems to be offline. Fire it up and I'll be right with you."
+            yield "Boss, both the C++ engine and Ollama seem to be offline."
         except httpx.TimeoutException:
             yield "Boss, the model timed out. Try a shorter question."
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             yield f"Boss, the AI backend hit an error: {exc}"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Tool Calling / Query Rewriter (Approach 2)
+    # Tool Calling / Query Rewriter
     # ─────────────────────────────────────────────────────────────────────────
 
     async def call_with_tools(
         self, messages: List[dict], tools: List[dict]
     ) -> Optional[dict]:
         """
-        Invoke Ollama with native tool specifications to resolve search queries / anaphora.
-        Returns the raw message dict containing tool_calls if emitted.
+        Invoke LLM with native tool specifications to resolve search queries.
+        Normalizes arguments into a Python dict regardless of backend.
         """
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "tools": tools,
-            "stream": False,
-            "options": {
-                "num_predict": 35,
-                "temperature": 0.1,
-                "num_thread": 4,
-            },
-        }
+        # 1. Primary: C++ llama-server
         try:
+            payload = {
+                "messages": messages,
+                "tools": tools,
+                "max_tokens": 40,
+                "temperature": 0.1,
+            }
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-                r = await client.post(f"{self.base_url}/api/chat", json=payload)
+                res = await client.post(f"{self.llama_url}/chat/completions", json=payload)
+                if res.status_code == 200:
+                    data = res.json()
+                    msg = data.get("choices", [{}])[0].get("message", {})
+                    tool_calls = msg.get("tool_calls", [])
+                    # Normalize arguments if JSON string
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        raw_args = func.get("arguments", {})
+                        if isinstance(raw_args, str):
+                            try:
+                                func["arguments"] = json.loads(raw_args)
+                            except Exception:
+                                func["arguments"] = {}
+                    return msg
+        except Exception as exc:
+            logger.info("llama-server tool call failed (%s), falling back to Ollama", exc)
+
+        # 2. Secondary: Ollama Fallback
+        try:
+            payload = {
+                "model": self.ollama_model,
+                "messages": messages,
+                "tools": tools,
+                "stream": False,
+                "options": {
+                    "num_predict": 35,
+                    "temperature": 0.1,
+                    "num_thread": 4,
+                },
+            }
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                r = await client.post(f"{self.ollama_url}/api/chat", json=payload)
                 r.raise_for_status()
                 return r.json().get("message", {})
-        except Exception as exc:  # noqa: BLE001
+        except Exception:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Health check
+    # Health Check
     # ─────────────────────────────────────────────────────────────────────────
 
     async def is_healthy(self) -> bool:
-        """Return True if Ollama is reachable and the model is loaded."""
+        """Return True if C++ llama-server or Ollama is online."""
+        # Check llama-server
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
-                r = await client.get(f"{self.base_url}/api/tags")
-                r.raise_for_status()
-                models = [m["name"] for m in r.json().get("models", [])]
-                return any(self.model in m for m in models)
-        except Exception:  # noqa: BLE001
-            return False
+            async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
+                r = await client.get(f"{self.llama_url.rsplit('/', 1)[0]}/health")
+                if r.status_code == 200 and r.json().get("status") == "ok":
+                    return True
+        except Exception:
+            pass
+
+        # Fallback check Ollama
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
+                r = await client.get(f"{self.ollama_url}/api/tags")
+                if r.status_code == 200:
+                    models = [m["name"] for m in r.json().get("models", [])]
+                    return any(self.ollama_model in m for m in models)
+        except Exception:
+            pass
+
+        return False
+
+
+# Backward compatibility alias
+OllamaClient = LLMClient

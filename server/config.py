@@ -9,6 +9,11 @@ load_dotenv()
 
 
 class Config:
+    # ── LLM Inference (C++ llama-server with Ollama fallback) ─────────────────
+    LLM_BACKEND: str = os.getenv("LLM_BACKEND", "llama_cpp")  # "llama_cpp" | "ollama"
+    LLAMA_CPP_BASE_URL: str = os.getenv("LLAMA_CPP_BASE_URL", "http://127.0.0.1:8080/v1")
+    LLAMA_CPP_MODEL: str = os.getenv("LLAMA_CPP_MODEL", "/data/jarvis_models/jarvis-3b-q4.gguf")
+
     # ── Ollama ────────────────────────────────────────────────────────────────
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "jarvis")
