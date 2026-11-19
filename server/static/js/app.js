@@ -19,6 +19,9 @@ class LiveModeController {
     this._currentReplyText = '';
     this._restartTimer = null;
     this._silenceTimer = null;
+    this._watchdogTimer = null;
+    this._userSpeakingInTurn = false;
+    this._lastVoiceTimestamp = 0;
     this._lastSpokenText = '';
 
     // DOM references
@@ -66,19 +69,22 @@ class LiveModeController {
 
     // Neural Silero VAD Manager for Instant Barge-In (<10ms) & Silence Endpointing
     this._vad = new SileroVADManager({
-      positiveSpeechThreshold: 0.5,
-      negativeSpeechThreshold: 0.35,
-      minSpeechFrames: 8, // ~256ms of continuous speech
-      redemptionFrames: 25, // ~800ms of real silence
+      positiveSpeechThreshold: 0.45,
+      negativeSpeechThreshold: 0.25,
+      minSpeechFrames: 4,
+      silenceFrames: 22,
       onAudioLevel: (rms) => {
         if (this.state === 'listening') {
           this._updateOrbAudioReaction(rms, 'listening');
+          this._checkAudioLevelWatchdog(rms);
         }
       },
       onSpeechStart: () => {
         if (!this.isActive || this.isMuted) return;
-        // Inform speech recognizer of speech start to reset utterance buffer
+        this._userSpeakingInTurn = true;
+        this._lastVoiceTimestamp = Date.now();
         this._stt?.startUtterance?.();
+
         // If JARVIS is speaking or playing audio -> INSTANT BARGE-IN!
         if (this.state === 'speaking' || this.liveAudioQueue.isPlaying) {
           console.log('[LiveMode] Silero VAD detected user speech during playback -> Triggering instant barge-in!');
@@ -88,20 +94,8 @@ class LiveModeController {
       onSpeechEnd: () => {
         if (!this.isActive || this.isMuted) return;
         if (this.state !== 'listening') return;
-
-        const text = (this._lastSpokenText || '').trim();
-        this._lastSpokenText = '';
-        clearTimeout(this._silenceTimer);
-        clearTimeout(this._restartTimer);
-
-        if (text) {
-          // Web Speech delivered the text
-          this._stt.stopListening();
-          this._handleUserSpoke(text);
-        } else {
-          // Web Speech was unavailable or didn't produce text -> use server Whisper STT via audio_utterance
-          this._handleAudioUtterance();
-        }
+        console.log('[LiveMode] VAD onSpeechEnd triggered');
+        this.commitUtterance();
       },
     });
 
@@ -281,21 +275,69 @@ class LiveModeController {
     }
   }
 
+  _checkAudioLevelWatchdog(rms) {
+    if (!this.isActive || this.isMuted || this.state !== 'listening') return;
+    const now = Date.now();
+    if (rms >= 0.02) {
+      if (!this._userSpeakingInTurn) {
+        this._userSpeakingInTurn = true;
+        this._stt?.startUtterance?.();
+      }
+      this._lastVoiceTimestamp = now;
+      clearTimeout(this._watchdogTimer);
+      this._watchdogTimer = null;
+    } else if (this._userSpeakingInTurn) {
+      if (now - this._lastVoiceTimestamp > 850 && !this._watchdogTimer) {
+        this._watchdogTimer = setTimeout(() => {
+          if (this.isActive && this.state === 'listening' && this._userSpeakingInTurn) {
+            console.log('[LiveMode] Watchdog silence timeout reached (~850ms)');
+            this.commitUtterance();
+          }
+        }, 50);
+      }
+    }
+  }
+
+  commitUtterance() {
+    if (!this.isActive || this.isMuted) return;
+    if (this.state !== 'listening') return;
+
+    this._userSpeakingInTurn = false;
+    clearTimeout(this._silenceTimer);
+    clearTimeout(this._restartTimer);
+    clearTimeout(this._watchdogTimer);
+
+    const text = (this._lastSpokenText || '').trim();
+    this._lastSpokenText = '';
+
+    if (text) {
+      console.log('[LiveMode] Submitting text utterance:', text);
+      this._stt.stopListening();
+      this._handleUserSpoke(text);
+    } else {
+      console.log('[LiveMode] Submitting audio utterance via server Whisper...');
+      this._handleAudioUtterance();
+    }
+  }
+
   async enter() {
     if (!this._stt.supported) {
       showToast('Live voice mode requires microphone support in your browser.', 'error');
       return;
     }
 
-    // Unlock browser AudioContext inside this click gesture
+    // Unlock browser AudioContexts inside direct user click gesture
     this.liveAudioQueue.unlock();
     this.app.audioPlayer.unlock();
+    this._vad.unlock();
     this.app.micController?.stop();
 
     this.isActive = true;
     this.isMuted = false;
     this._pendingTranscript = '';
     this._currentReplyText = '';
+    this._lastSpokenText = '';
+    this._userSpeakingInTurn = false;
     this._updateMuteBtn();
 
     if (this.userCaption) this.userCaption.textContent = '';
@@ -328,6 +370,8 @@ class LiveModeController {
     this.isActive = false;
     clearTimeout(this._restartTimer);
     clearTimeout(this._silenceTimer);
+    clearTimeout(this._watchdogTimer);
+    this._userSpeakingInTurn = false;
     this._stt.abort();
     this._vad.stop();
     this.liveAudioQueue.stop();
@@ -399,7 +443,11 @@ class LiveModeController {
   startListening() {
     if (!this.isActive || this.isMuted) return;
     clearTimeout(this._restartTimer);
+    clearTimeout(this._silenceTimer);
+    clearTimeout(this._watchdogTimer);
+    this._userSpeakingInTurn = false;
     this._pendingTranscript = '';
+    this._lastSpokenText = '';
     this.setState('listening');
     this._stt.startListening();
   }
@@ -414,12 +462,13 @@ class LiveModeController {
   }
 
   async _handleAudioUtterance() {
-    if (!this.isActive || this.isMuted || this.state !== 'listening') return;
+    if (!this.isActive || this.isMuted) return;
     this.setState('thinking');
     if (this.jarvisCaption) this.jarvisCaption.textContent = 'Processing speech...';
 
     const blob = await this._stt.stopAndGetAudioBlob();
-    if (!blob || blob.size < 2000) {
+    if (!blob || blob.size < 1500) {
+      console.log('[LiveMode] Audio chunk too small (' + (blob ? blob.size : 0) + ' bytes), resume listening');
       this.setState('listening');
       this.startListening();
       return;

@@ -410,7 +410,7 @@ class UniversalVoiceRecognizer {
   }
 
   async startListening() {
-    if (this.isListening) return true;
+    this.isListening = true;
     try {
       await this.acquireMicrophone();
     } catch (micErr) {
@@ -419,11 +419,7 @@ class UniversalVoiceRecognizer {
       return false;
     }
 
-    this.isListening = true;
-    this.onStart?.();
     this._startLevelMonitor();
-
-    // Start background MediaRecorder capture
     this._startMediaRecorder();
 
     // If Web Speech API is supported and not flagged as broken, try it in parallel
@@ -431,6 +427,7 @@ class UniversalVoiceRecognizer {
       this._startWebSpeech();
     }
 
+    this.onStart?.();
     return true;
   }
 
@@ -504,13 +501,14 @@ class UniversalVoiceRecognizer {
       }
 
       const rec = new MediaRecorder(this.activeStream, options);
+      this._mimeType = rec.mimeType || options.mimeType || 'audio/webm';
       rec.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) {
           this._recordedChunks.push(e.data);
         }
       };
 
-      rec.start(250);
+      rec.start(200);
       this._mediaRecorder = rec;
       return true;
     } catch (recErr) {
@@ -522,7 +520,7 @@ class UniversalVoiceRecognizer {
   async stopAndGetAudioBlob() {
     if (!this._mediaRecorder || this._mediaRecorder.state === 'inactive') {
       if (this._recordedChunks.length > 0) {
-        const mime = this._mediaRecorder?.mimeType || 'audio/webm';
+        const mime = this._mimeType || 'audio/webm';
         const blob = new Blob(this._recordedChunks, { type: mime });
         this._recordedChunks = [];
         return blob;
@@ -533,18 +531,16 @@ class UniversalVoiceRecognizer {
     return new Promise((resolve) => {
       const rec = this._mediaRecorder;
       rec.onstop = () => {
-        const mime = rec.mimeType || 'audio/webm';
+        const mime = rec.mimeType || this._mimeType || 'audio/webm';
         const blob = new Blob(this._recordedChunks, { type: mime });
         this._recordedChunks = [];
-        // Immediately restart for next utterance
-        if (this.isListening) {
-          this._startMediaRecorder();
-        }
+        this._mediaRecorder = null;
         resolve(blob);
       };
       try {
         rec.stop();
       } catch (_) {
+        this._mediaRecorder = null;
         resolve(null);
       }
     });
@@ -593,10 +589,11 @@ class UniversalVoiceRecognizer {
         const rec = this._mediaRecorder;
         rec.onstop = async () => {
           try {
-            const mime = rec.mimeType || 'audio/webm';
+            const mime = rec.mimeType || this._mimeType || 'audio/webm';
             const blob = new Blob(this._recordedChunks, { type: mime });
             this._recordedChunks = [];
-            if (blob.size > 2000) {
+            this._mediaRecorder = null;
+            if (blob.size > 1500) {
               await this._transcribeOnServer(blob);
             }
           } catch (e) {
@@ -607,6 +604,7 @@ class UniversalVoiceRecognizer {
         try {
           rec.stop();
         } catch (_) {
+          this._mediaRecorder = null;
           resolve();
         }
       });
@@ -631,6 +629,7 @@ class UniversalVoiceRecognizer {
         this._mediaRecorder.onstop = null;
         this._mediaRecorder.stop();
       } catch (_) {}
+      this._mediaRecorder = null;
     }
   }
 
