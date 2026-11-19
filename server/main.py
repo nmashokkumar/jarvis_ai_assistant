@@ -283,7 +283,16 @@ async def ws_chat(websocket: WebSocket) -> None:
             message = data.get("message", "").strip()
             conv_id = data.get("conversation_id") or str(uuid.uuid4())
             mode = data.get("mode", "regular")
-            tts_enabled: bool = data.get("tts", False)
+            # Robust TTS toggle: Default to True for JARVIS voice assistant
+            raw_tts = data.get("tts")
+            if raw_tts is None:
+                tts_enabled = True
+            elif isinstance(raw_tts, str):
+                tts_enabled = raw_tts.lower() not in ("false", "0", "off", "no")
+            else:
+                tts_enabled = bool(raw_tts)
+
+            logger.info("WS request: message='%s', tts_enabled=%s", message, tts_enabled)
 
             if not message:
                 await websocket.send_json({"type": "error", "message": "Empty message."})
@@ -309,10 +318,12 @@ async def ws_chat(websocket: WebSocket) -> None:
                     clean = sentence_text.strip()
                     if clean:
                         try:
+                            logger.info("[TTS] Synthesizing chunk: '%s'", clean)
                             audio_bytes = await text_to_speech(clean)
                             if audio_bytes:
                                 audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
                                 await websocket.send_json({"type": "audio", "data": audio_b64})
+                                logger.info("[TTS] Sent audio chunk (%d bytes)", len(audio_bytes))
                         except Exception as tts_exc:  # noqa: BLE001
                             logger.warning("TTS chunk synthesis failed: %s", tts_exc)
                     tts_queue.task_done()

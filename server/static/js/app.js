@@ -440,6 +440,14 @@ class JarvisApp {
   // Event Bindings
   // ---------------------------------------------------------------------------
   _bindEvents() {
+    // Global user-gesture audio unlocker (Chrome / Safari / Edge require user interaction)
+    const unlockAudio = () => {
+      if (this.audioPlayer) this.audioPlayer.unlock();
+    };
+    document.addEventListener('click', unlockAudio, { once: true, passive: true });
+    document.addEventListener('keydown', unlockAudio, { once: true, passive: true });
+    document.addEventListener('touchstart', unlockAudio, { once: true, passive: true });
+
     // Login form
     const loginBtn = document.getElementById('login-submit-btn');
     const loginInput = document.getElementById('login-token-input');
@@ -642,6 +650,11 @@ class JarvisApp {
     const text = (overrideText !== null ? overrideText : this.messageInput.value).trim();
     if (!text || this.isThinking) return;
 
+    // Proactively unlock AudioContext inside user gesture
+    if (this.audioPlayer) {
+      this.audioPlayer.unlock();
+    }
+
     // Clear input field if sent via text box
     if (this.messageInput && overrideText === null) {
       this.messageInput.value = '';
@@ -667,7 +680,7 @@ class JarvisApp {
         message: text,
         conversation_id: this.activeConversationId,
         mode: this.currentMode,
-        tts: forceTts || this.ttsEnabled,
+        tts: forceTts || this.ttsEnabled !== false,
         live_mode: liveMode
       };
       this.ws.send(JSON.stringify(payload));
@@ -686,7 +699,7 @@ class JarvisApp {
         break;
 
       case 'audio':
-        if (data.data && (this.ttsEnabled || this.liveMode?.isActive)) {
+        if (data.data) {
           if (this.liveMode?.isActive) this.liveMode.onAudioReceived();
           this.audioPlayer.playBase64Audio(data.data);
         }

@@ -31,17 +31,25 @@ class AudioPlayer {
 
   /**
    * Unlocks or creates the Web AudioContext.
-   * Should be called inside a user click gesture (e.g. "Enter Live Mode").
+   * Should be called inside a user gesture (e.g. click, keydown, "Enter Live Mode").
    */
   unlock() {
-    this._getCtx();
+    try {
+      const ctx = this._getCtx();
+      if (ctx && ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+    } catch (_) {}
   }
 
   _getCtx() {
     if (!this._ctx) {
-      this._ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (AudioCtx) {
+        this._ctx = new AudioCtx();
+      }
     }
-    if (this._ctx.state === 'suspended') {
+    if (this._ctx && this._ctx.state === 'suspended') {
       this._ctx.resume().catch(() => {});
     }
     return this._ctx;
@@ -73,33 +81,73 @@ class AudioPlayer {
   }
 
   async _play(base64data) {
+    if (!base64data) return;
+
+    // 1. Primary: Web Audio API (Low latency, sample-accurate queuing)
+    try {
+      const ctx = this._getCtx();
+      if (ctx) {
+        if (ctx.state === 'suspended') {
+          await ctx.resume().catch(() => {});
+        }
+        if (ctx.state === 'running') {
+          const played = await new Promise((resolve) => {
+            try {
+              const binary = atob(base64data);
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+              ctx.decodeAudioData(
+                bytes.buffer.slice(0),
+                (buffer) => {
+                  const source = ctx.createBufferSource();
+                  source.buffer = buffer;
+                  source.connect(ctx.destination);
+                  this._source = source;
+                  source.onended = () => {
+                    this._source = null;
+                    resolve(true);
+                  };
+                  source.start(0);
+                },
+                (err) => {
+                  console.warn('[AudioPlayer] Web Audio decode error, falling back to HTML5 Audio:', err);
+                  resolve(false);
+                }
+              );
+            } catch (err) {
+              console.warn('[AudioPlayer] Web Audio exception, falling back to HTML5 Audio:', err);
+              resolve(false);
+            }
+          });
+
+          if (played) return;
+        }
+      }
+    } catch (_) {}
+
+    // 2. Universal Fallback: HTML5 Audio (Plays reliably across all mobile & desktop browsers)
+    await this._playHtml5Audio(base64data);
+  }
+
+  async _playHtml5Audio(base64data) {
     return new Promise((resolve) => {
       try {
-        const ctx = this._getCtx();
-        const binary = atob(base64data);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-
-        ctx.decodeAudioData(
-          bytes.buffer,
-          (buffer) => {
-            const source = ctx.createBufferSource();
-            source.buffer = buffer;
-            source.connect(ctx.destination);
-            this._source = source;
-            source.onended = () => {
-              this._source = null;
-              resolve();
-            };
-            source.start(0);
-          },
-          (err) => {
-            console.warn('[AudioPlayer] decodeAudioData error:', err);
+        const audio = new Audio("data:audio/wav;base64," + base64data);
+        audio.onended = () => resolve();
+        audio.onerror = (e) => {
+          console.warn('[AudioPlayer] HTML5 audio error:', e);
+          resolve();
+        };
+        const playPromise = audio.play();
+        if (playPromise !== undefined) {
+          playPromise.catch((err) => {
+            console.warn('[AudioPlayer] HTML5 audio play blocked:', err);
             resolve();
-          }
-        );
+          });
+        }
       } catch (err) {
-        console.warn('[AudioPlayer] play error:', err);
+        console.warn('[AudioPlayer] HTML5 audio fallback failed:', err);
         resolve();
       }
     });
