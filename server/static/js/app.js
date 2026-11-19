@@ -77,6 +77,8 @@ class LiveModeController {
       },
       onSpeechStart: () => {
         if (!this.isActive || this.isMuted) return;
+        // Inform speech recognizer of speech start to reset utterance buffer
+        this._stt?.startUtterance?.();
         // If JARVIS is speaking or playing audio -> INSTANT BARGE-IN!
         if (this.state === 'speaking' || this.liveAudioQueue.isPlaying) {
           console.log('[LiveMode] Silero VAD detected user speech during playback -> Triggering instant barge-in!');
@@ -85,20 +87,26 @@ class LiveModeController {
       },
       onSpeechEnd: () => {
         if (!this.isActive || this.isMuted) return;
-        // Voice ended -> dispatch query
-        if (this.state === 'listening' && this._lastSpokenText) {
-          const toSend = this._lastSpokenText;
-          this._lastSpokenText = '';
-          clearTimeout(this._silenceTimer);
-          clearTimeout(this._restartTimer);
+        if (this.state !== 'listening') return;
+
+        const text = (this._lastSpokenText || '').trim();
+        this._lastSpokenText = '';
+        clearTimeout(this._silenceTimer);
+        clearTimeout(this._restartTimer);
+
+        if (text) {
+          // Web Speech delivered the text
           this._stt.stopListening();
-          this._handleUserSpoke(toSend);
+          this._handleUserSpoke(text);
+        } else {
+          // Web Speech was unavailable or didn't produce text -> use server Whisper STT via audio_utterance
+          this._handleAudioUtterance();
         }
       },
     });
 
-    // Dedicated SpeechRecognition instance for Live Mode with smart fast-endpointing
-    this._stt = new SpeechRecognitionManager({
+    // Dedicated Universal Voice Recognizer for Live Mode
+    this._stt = new UniversalVoiceRecognizer({
       onStart: () => {
         if (this.isActive && !this.isMuted && this.state !== 'speaking' && this.state !== 'thinking') {
           this.setState('listening');
@@ -138,16 +146,14 @@ class LiveModeController {
       },
       onError: (err) => {
         if (!this.isActive) return;
-        if (err === 'not-allowed' || err === 'service-not-allowed') {
-          this.isMuted = true;
-          this.setState('paused');
-          this._updateMuteBtn();
-          showToast('Microphone permission denied. Please allow mic access.', 'error');
-        } else if (err === 'no-speech' && !this.isMuted && this.state === 'listening') {
-          this._scheduleListenRestart(350);
-        } else if (err !== 'aborted' && err !== 'no-speech') {
-          console.warn('[LiveMode STT] error:', err);
+        if (err === 'no-speech') {
+          if (!this.isMuted && this.state === 'listening') {
+            this._scheduleListenRestart(250);
+          }
+          return;
         }
+        if (err === 'aborted') return;
+        console.warn('[LiveMode STT] Note:', err);
       },
     });
 
@@ -166,7 +172,7 @@ class LiveModeController {
           this._updateMuteBtn();
           this.startListening();
         } else if (this.state === 'listening') {
-          this._stt.stopListening();
+          this.toggleMute();
         }
       });
     }
@@ -252,6 +258,12 @@ class LiveModeController {
         this.onToken(data.content);
         break;
 
+      case 'transcript':
+        if (data.role === 'user' && this.userCaption) {
+          this.userCaption.textContent = `"${data.text}"`;
+        }
+        break;
+
       case 'pcm_chunk':
         // Full-duplex raw 24kHz s16le PCM streaming
         this.setState('speaking');
@@ -269,9 +281,9 @@ class LiveModeController {
     }
   }
 
-  enter() {
+  async enter() {
     if (!this._stt.supported) {
-      showToast('Live voice mode requires Chrome or Edge browser with microphone support.', 'error');
+      showToast('Live voice mode requires microphone support in your browser.', 'error');
       return;
     }
 
@@ -297,8 +309,17 @@ class LiveModeController {
     // Connect dedicated Live WebSocket
     this.connectLiveWs();
 
-    // Start background Neural Silero VAD for instant voice barge-in
-    this._vad.start().catch((e) => console.warn('[LiveMode] Silero VAD start warning:', e));
+    try {
+      // 1. Acquire microphone once to avoid hardware contention
+      const stream = await this._stt.acquireMicrophone();
+      // 2. Share active stream with Neural Silero VAD
+      await this._vad.start(stream);
+    } catch (e) {
+      console.warn('[LiveMode] Mic acquisition error:', e);
+      showToast('Microphone access denied. Please allow microphone permissions.', 'error');
+      this.exit();
+      return;
+    }
 
     this.startListening();
   }
@@ -390,6 +411,57 @@ class LiveModeController {
         this.startListening();
       }
     }, delay);
+  }
+
+  async _handleAudioUtterance() {
+    if (!this.isActive || this.isMuted || this.state !== 'listening') return;
+    this.setState('thinking');
+    if (this.jarvisCaption) this.jarvisCaption.textContent = 'Processing speech...';
+
+    const blob = await this._stt.stopAndGetAudioBlob();
+    if (!blob || blob.size < 2000) {
+      this.setState('listening');
+      this.startListening();
+      return;
+    }
+
+    try {
+      const b64 = await blobToBase64(blob);
+      if (this.liveWs && this.liveWs.readyState === WebSocket.OPEN) {
+        this.turnId++;
+        this.liveAudioQueue.startTurn(this.turnId);
+        this.liveWs.send(JSON.stringify({
+          type: 'audio_utterance',
+          audio: b64,
+          turn_id: this.turnId,
+          conversation_id: this.app.activeConversationId,
+          mode: this.app.currentMode
+        }));
+      } else {
+        const fd = new FormData();
+        fd.append('file', blob, 'audio.webm');
+        const token = localStorage.getItem('jarvis_token') || 'jarvis123';
+        const res = await fetch(`${CONFIG.getServerUrl()}/api/voice/transcribe?token=${encodeURIComponent(token)}`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` },
+          body: fd
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const tr = (data.text || '').trim();
+          if (tr) {
+            this._handleUserSpoke(tr);
+            return;
+          }
+        }
+        this.setState('listening');
+        this.startListening();
+      }
+    } catch (e) {
+      console.warn('[LiveMode] Audio utterance handling error:', e);
+      this.setState('listening');
+      this.startListening();
+    }
   }
 
   _handleUserSpoke(text) {

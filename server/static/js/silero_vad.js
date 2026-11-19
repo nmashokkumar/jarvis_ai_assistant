@@ -159,20 +159,27 @@ class SileroVADManager {
 
   /**
    * Starts real-time microphone capture via Web Audio ScriptProcessor/AudioWorklet resampled to 16kHz.
+   * Can reuse an existing MediaStream to avoid duplicate hardware device locks.
    */
-  async start() {
+  async start(existingStream = null) {
     if (this.isListening) return true;
     const ready = await this.loadModel();
     if (!ready) return false;
 
     try {
-      this._mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
+      if (existingStream && existingStream.active) {
+        this._mediaStream = existingStream;
+        this._ownsStream = false;
+      } else {
+        this._mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+        this._ownsStream = true;
+      }
 
       this._audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const source = this._audioCtx.createMediaStreamSource(this._mediaStream);
@@ -255,12 +262,12 @@ class SileroVADManager {
       try { this._muteNode.disconnect(); } catch (_) {}
       this._muteNode = null;
     }
-    if (this._mediaStream) {
+    if (this._ownsStream && this._mediaStream) {
       try {
         this._mediaStream.getTracks().forEach(t => t.stop());
       } catch (_) {}
-      this._mediaStream = null;
     }
+    this._mediaStream = null;
     if (this._audioCtx && this._audioCtx.state !== 'closed') {
       try { this._audioCtx.close(); } catch (_) {}
       this._audioCtx = null;

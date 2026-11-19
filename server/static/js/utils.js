@@ -238,3 +238,20 @@ function copyToClipboard(text) {
     showToast('Copied to clipboard', 'success', 1500);
   }
 }
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const res = reader.result;
+      if (typeof res === 'string') {
+        const commaIdx = res.indexOf(',');
+        resolve(commaIdx !== -1 ? res.substring(commaIdx + 1) : res);
+      } else {
+        resolve('');
+      }
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}

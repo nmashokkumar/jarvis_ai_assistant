@@ -361,91 +361,321 @@ class AudioPlayer {
 }
 
 // ---------------------------------------------------------------------------
-// SpeechRecognitionManager
+// UniversalVoiceRecognizer — Full-Duplex Robust Speech Recognition
+// Dual-Engine: Uses Web Speech API for low-latency live streaming when available,
+// with automatic transparent fallback to HTML5 MediaRecorder + Server faster-whisper STT.
+// Guaranteed to work across all browsers (Chrome, Edge, Brave, Firefox, Safari, Mobile).
 // ---------------------------------------------------------------------------
-class SpeechRecognitionManager {
-  constructor({ onResult, onStart, onEnd, onError } = {}) {
-    this.onResult = onResult;
-    this.onStart = onStart;
-    this.onEnd = onEnd;
-    this.onError = onError;
+class UniversalVoiceRecognizer {
+  constructor({ onResult, onStart, onEnd, onError, onAudioLevel } = {}) {
+    this.onResult = onResult || null;
+    this.onStart = onStart || null;
+    this.onEnd = onEnd || null;
+    this.onError = onError || null;
+    this.onAudioLevel = onAudioLevel || null;
+
     this.isListening = false;
+    this.activeStream = null;
+    this._mediaRecorder = null;
+    this._recordedChunks = [];
     this._recognition = null;
-    this._supported = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
-  }
+    this._useServerFallback = false;
+    this._analyser = null;
+    this._audioCtx = null;
+    this._animId = null;
 
-  get supported() { return this._supported; }
-
-  _create() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    const r = new SR();
-    r.continuous = true; // Continuous listening so browser doesn't abruptly cut off mid-thought!
-    r.interimResults = true;
-    r.lang = 'en-IN'; // Indian English recognition for accurate accent comprehension
-    r.maxAlternatives = 1;
-
-    r.onstart = () => {
-      this.isListening = true;
-      this.onStart?.();
-    };
-
-    r.onresult = (e) => {
-      let interim = '';
-      let final = '';
-      for (let i = e.resultIndex; i < e.results.length; i++) {
-        const t = e.results[i][0].transcript;
-        if (e.results[i].isFinal) final += t;
-        else interim += t;
-      }
-      this.onResult?.({ interim, final, isFinal: !!final });
-    };
-
-    r.onend = () => {
-      this.isListening = false;
-      this.onEnd?.();
-    };
-
-    r.onerror = (e) => {
-      this.isListening = false;
-      this.onError?.(e.error);
-    };
-
-    return r;
+    this.hasWebSpeech = !!SR;
   }
 
-  startListening() {
-    if (!this._supported) {
-      showToast('Speech recognition is not supported in this browser. Please use Chrome or Edge.', 'error');
-      return false;
+  get supported() {
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  }
+
+  async acquireMicrophone() {
+    if (this.activeStream && this.activeStream.active) {
+      return this.activeStream;
     }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Microphone access is not supported in this browser.');
+    }
+    this.activeStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      }
+    });
+    return this.activeStream;
+  }
+
+  async startListening() {
     if (this.isListening) return true;
     try {
-      this._recognition = this._create();
-      this._recognition.start();
+      await this.acquireMicrophone();
+    } catch (micErr) {
+      console.warn('[UniversalSTT] Microphone access error:', micErr);
+      this.onError?.('Microphone access denied. Please allow microphone in browser.');
+      return false;
+    }
+
+    this.isListening = true;
+    this.onStart?.();
+    this._startLevelMonitor();
+
+    // Start background MediaRecorder capture
+    this._startMediaRecorder();
+
+    // If Web Speech API is supported and not flagged as broken, try it in parallel
+    if (this.hasWebSpeech && !this._useServerFallback) {
+      this._startWebSpeech();
+    }
+
+    return true;
+  }
+
+  startUtterance() {
+    // Reset buffer at start of actual detected speech
+    this._recordedChunks = [];
+    if (!this._mediaRecorder || this._mediaRecorder.state === 'inactive') {
+      this._startMediaRecorder();
+    }
+  }
+
+  _startWebSpeech() {
+    try {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const r = new SR();
+      r.continuous = true;
+      r.interimResults = true;
+      r.lang = navigator.language || 'en-US';
+      r.maxAlternatives = 1;
+
+      r.onresult = (e) => {
+        let interim = '';
+        let final = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const t = e.results[i][0].transcript;
+          if (e.results[i].isFinal) final += t;
+          else interim += t;
+        }
+        this.onResult?.({ interim, final, isFinal: !!final });
+      };
+
+      r.onerror = (e) => {
+        console.warn('[UniversalSTT] Web Speech API notice:', e.error);
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed' || e.error === 'audio-capture' || e.error === 'network') {
+          // Seamlessly switch to Server Whisper fallback without pausing
+          this._useServerFallback = true;
+          try { r.abort(); } catch (_) {}
+          this._recognition = null;
+        }
+      };
+
+      r.onend = () => {
+        if (this.isListening && !this._useServerFallback) {
+          try { r.start(); } catch (_) {}
+        }
+      };
+
+      r.start();
+      this._recognition = r;
       return true;
     } catch (err) {
-      console.error('[STT] start error:', err);
-      this.onError?.(err.message);
+      console.warn('[UniversalSTT] Web Speech start failed, falling back to MediaRecorder:', err);
+      this._useServerFallback = true;
       return false;
     }
   }
 
-  stopListening() {
+  _startMediaRecorder() {
+    if (!this.activeStream || !this.activeStream.active) return false;
+    try {
+      if (this._mediaRecorder && this._mediaRecorder.state === 'recording') {
+        return true;
+      }
+      this._recordedChunks = [];
+      let options = {};
+      if (typeof MediaRecorder !== 'undefined') {
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) options = { mimeType: 'audio/webm;codecs=opus' };
+        else if (MediaRecorder.isTypeSupported('audio/webm')) options = { mimeType: 'audio/webm' };
+        else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) options = { mimeType: 'audio/ogg;codecs=opus' };
+        else if (MediaRecorder.isTypeSupported('audio/mp4')) options = { mimeType: 'audio/mp4' };
+      }
+
+      const rec = new MediaRecorder(this.activeStream, options);
+      rec.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          this._recordedChunks.push(e.data);
+        }
+      };
+
+      rec.start(250);
+      this._mediaRecorder = rec;
+      return true;
+    } catch (recErr) {
+      console.error('[UniversalSTT] MediaRecorder start error:', recErr);
+      return false;
+    }
+  }
+
+  async stopAndGetAudioBlob() {
+    if (!this._mediaRecorder || this._mediaRecorder.state === 'inactive') {
+      if (this._recordedChunks.length > 0) {
+        const mime = this._mediaRecorder?.mimeType || 'audio/webm';
+        const blob = new Blob(this._recordedChunks, { type: mime });
+        this._recordedChunks = [];
+        return blob;
+      }
+      return null;
+    }
+
+    return new Promise((resolve) => {
+      const rec = this._mediaRecorder;
+      rec.onstop = () => {
+        const mime = rec.mimeType || 'audio/webm';
+        const blob = new Blob(this._recordedChunks, { type: mime });
+        this._recordedChunks = [];
+        // Immediately restart for next utterance
+        if (this.isListening) {
+          this._startMediaRecorder();
+        }
+        resolve(blob);
+      };
+      try {
+        rec.stop();
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  }
+
+  async _transcribeOnServer(blob) {
+    try {
+      const fd = new FormData();
+      fd.append('file', blob, 'recording.webm');
+      const token = localStorage.getItem('jarvis_token') || 'jarvis123';
+      const url = `${CONFIG.getServerUrl()}/api/voice/transcribe?token=${encodeURIComponent(token)}`;
+
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` },
+        body: fd
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        const text = (data.text || '').trim();
+        if (text) {
+          this.onResult?.({ interim: '', final: text, isFinal: true });
+        }
+      }
+    } catch (transcribeErr) {
+      console.warn('[UniversalSTT] Server transcription error:', transcribeErr);
+    }
+  }
+
+  async stopListening() {
+    if (!this.isListening) return;
+    this.isListening = false;
+    this._stopLevelMonitor();
+
     if (this._recognition) {
-      try { this._recognition.stop(); } catch (_) {}
+      try {
+        this._recognition.onend = null;
+        this._recognition.stop();
+      } catch (_) {}
       this._recognition = null;
     }
-    this.isListening = false;
+
+    if (this._mediaRecorder && this._mediaRecorder.state !== 'inactive') {
+      await new Promise((resolve) => {
+        const rec = this._mediaRecorder;
+        rec.onstop = async () => {
+          try {
+            const mime = rec.mimeType || 'audio/webm';
+            const blob = new Blob(this._recordedChunks, { type: mime });
+            this._recordedChunks = [];
+            if (blob.size > 2000) {
+              await this._transcribeOnServer(blob);
+            }
+          } catch (e) {
+            console.warn('[UniversalSTT] onstop transcription error:', e);
+          }
+          resolve();
+        };
+        try {
+          rec.stop();
+        } catch (_) {
+          resolve();
+        }
+      });
+    }
+
+    this.onEnd?.();
   }
 
   abort() {
+    this.isListening = false;
+    this._recordedChunks = [];
+    this._stopLevelMonitor();
     if (this._recognition) {
-      try { this._recognition.abort(); } catch (_) {}
+      try {
+        this._recognition.onend = null;
+        this._recognition.abort();
+      } catch (_) {}
       this._recognition = null;
     }
-    this.isListening = false;
+    if (this._mediaRecorder && this._mediaRecorder.state !== 'inactive') {
+      try {
+        this._mediaRecorder.onstop = null;
+        this._mediaRecorder.stop();
+      } catch (_) {}
+    }
+  }
+
+  _startLevelMonitor() {
+    if (!this.activeStream || this._animId) return;
+    try {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      this._audioCtx = new AudioCtx();
+      const src = this._audioCtx.createMediaStreamSource(this.activeStream);
+      this._analyser = this._audioCtx.createAnalyser();
+      this._analyser.fftSize = 64;
+      src.connect(this._analyser);
+
+      const data = new Uint8Array(this._analyser.frequencyBinCount);
+      const loop = () => {
+        if (!this.isListening) {
+          this._animId = null;
+          return;
+        }
+        this._analyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const avg = sum / (data.length * 255.0);
+        this.onAudioLevel?.(avg);
+        this._animId = requestAnimationFrame(loop);
+      };
+      this._animId = requestAnimationFrame(loop);
+    } catch (_) {}
+  }
+
+  _stopLevelMonitor() {
+    if (this._animId) {
+      cancelAnimationFrame(this._animId);
+      this._animId = null;
+    }
+    if (this._audioCtx && this._audioCtx.state !== 'closed') {
+      try { this._audioCtx.close(); } catch (_) {}
+      this._audioCtx = null;
+    }
+    this.onAudioLevel?.(0);
   }
 }
+
+// Backwards-compatibility alias
+const SpeechRecognitionManager = UniversalVoiceRecognizer;
 
 // ---------------------------------------------------------------------------
 // MicButton — standard push-to-talk / click-to-toggle for text chat dock
@@ -458,11 +688,12 @@ class MicButton {
     this._interimEl = null;
     this._pendingFinal = '';
 
-    this._stt = new SpeechRecognitionManager({
+    this._stt = new UniversalVoiceRecognizer({
       onResult: ({ interim, final, isFinal }) => {
-        this._updateInterim(interim || final);
+        const text = (final || interim || '').trim();
+        this._updateInterim(text);
         if (isFinal) {
-          this._pendingFinal = final.trim();
+          this._pendingFinal = text;
         }
       },
       onStart: () => this._setRecording(true),
@@ -478,7 +709,7 @@ class MicButton {
         this._setRecording(false);
         this._clearInterim();
         if (err !== 'no-speech' && err !== 'aborted') {
-          showToast(`Microphone error: ${err}`, 'error');
+          showToast(`Microphone: ${err}`, 'error');
         }
       },
     });
@@ -487,19 +718,16 @@ class MicButton {
   }
 
   _bind() {
-    this.btn.addEventListener('click', () => {
+    this.btn.addEventListener('click', async () => {
       if (this._stt.isListening) {
-        this._stt.stopListening();
+        await this._stt.stopListening();
       } else {
         this.audioPlayer?.stop();
-        this._stt.startListening();
+        this._pendingFinal = '';
+        await this._stt.startListening();
+        this._stt.startUtterance();
       }
     });
-
-    if (!this._stt.supported) {
-      this.btn.disabled = true;
-      this.btn.title = 'Speech recognition not supported in this browser';
-    }
   }
 
   _setRecording(active) {
@@ -525,5 +753,5 @@ class MicButton {
     }
   }
 
-  stop() { this._stt.stopListening(); }
+  stop() { this._stt.abort(); }
 }

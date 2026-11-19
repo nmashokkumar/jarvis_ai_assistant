@@ -27,7 +27,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import (
     Depends,
     FastAPI,
+    File,
     HTTPException,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -128,6 +130,15 @@ async def lifespan(app: FastAPI):
             logger.info("Kokoro ONNX engine pre-warmed (voice: %s)", getattr(settings, 'KOKORO_VOICE', 'af_heart'))
         except Exception as tts_init_err:
             logger.warning("Kokoro pre-warm warning: %s", tts_init_err)
+
+    # Pre-warm faster-whisper STT engine
+    try:
+        from voice.stt import get_whisper
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, get_whisper)
+        logger.info("faster-whisper STT engine pre-warmed (model: tiny.en)")
+    except Exception as stt_init_err:
+        logger.warning("Whisper pre-warm warning: %s", stt_init_err)
 
     yield
 
@@ -234,6 +245,25 @@ async def system_status_api() -> Dict[str, Any]:
         "uptime_seconds": int(uptime),
         "summary": get_system_status(),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Speech-To-Text (REST)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/api/voice/transcribe")
+async def transcribe_voice_api(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """Transcribe client-uploaded audio (WebM, WAV, OGG, MP4) using local faster-whisper."""
+    from voice.stt import transcribe_audio
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty audio payload")
+    try:
+        text = await transcribe_audio(content)
+        return {"status": "ok", "text": text}
+    except Exception as exc:
+        logger.error("Audio transcription failed: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 
@@ -692,6 +722,50 @@ async def ws_live(websocket: WebSocket) -> None:
                 await db.save_message(conv_id, "user", raw_text)
 
                 logger.info("Live Voice Turn %d: '%s'", turn_id, raw_text)
+                await safe_send({"type": "state", "state": "thinking", "turn_id": turn_id})
+                active_gen_task = asyncio.create_task(
+                    run_turn_generator(turn_id, raw_text, conv_id, mode)
+                )
+
+            elif msg_type == "audio_utterance":
+                raw_b64 = data.get("audio", "")
+                if not raw_b64:
+                    continue
+                turn_id = data.get("turn_id", active_turn_id + 1)
+                conv_id = data.get("conversation_id") or session_id
+                mode = data.get("mode", "regular")
+
+                try:
+                    audio_bytes = base64.b64decode(raw_b64)
+                    from voice.stt import transcribe_audio
+                    raw_text = await transcribe_audio(audio_bytes)
+                except Exception as stt_err:
+                    logger.warning("Audio utterance transcription error: %s", stt_err)
+                    await safe_send({"type": "state", "state": "listening", "turn_id": turn_id})
+                    continue
+
+                if not raw_text.strip():
+                    await safe_send({"type": "state", "state": "listening", "turn_id": turn_id})
+                    continue
+
+                # Abort any in-flight turn
+                await abort_active_turn(active_turn_id)
+
+                # Initialize new turn state
+                active_turn_id = turn_id
+                spoken_sentences.clear()
+                confirmed_chunks.clear()
+                turn_user_text = raw_text
+                turn_conv_id = conv_id
+                turn_full_response_text = ""
+                turn_assistant_msg_saved = False
+
+                # Ensure conversation exists and commit user utterance to history
+                await db.get_or_create_conversation(conv_id, mode)
+                await db.save_message(conv_id, "user", raw_text)
+
+                logger.info("Live Voice Turn %d (via audio_utterance): '%s'", turn_id, raw_text)
+                await safe_send({"type": "transcript", "role": "user", "text": raw_text, "turn_id": turn_id})
                 await safe_send({"type": "state", "state": "thinking", "turn_id": turn_id})
                 active_gen_task = asyncio.create_task(
                     run_turn_generator(turn_id, raw_text, conv_id, mode)
