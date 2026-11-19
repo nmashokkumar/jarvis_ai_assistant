@@ -289,50 +289,96 @@ async def ws_chat(websocket: WebSocket) -> None:
                 await websocket.send_json({"type": "error", "message": "Empty message."})
                 continue
 
-            # Stream tokens + real-time sentence-by-sentence TTS for ultra-low latency
+            # Concurrent sentence-by-sentence TTS producer-consumer pipeline
             full_tokens: list[str] = []
             sentence_buffer = ""
             first_chunk_sent = False
+            tts_task: Optional[asyncio.Task] = None
+            tts_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
 
-            async def _synthesize_and_send(sentence_text: str):
-                clean = sentence_text.strip()
-                if not clean or not tts_enabled:
+            async def _tts_worker():
+                """Concurrent background worker: synthesizes sentences as queued without blocking LLM stream."""
+                if not tts_enabled:
                     return
-                try:
-                    from voice.tts import text_to_speech
-                    audio_bytes = await text_to_speech(clean)
-                    if audio_bytes:
-                        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                        await websocket.send_json({"type": "audio", "data": audio_b64})
-                except Exception as tts_exc:  # noqa: BLE001
-                    logger.warning("TTS chunk failed: %s", tts_exc)
+                from voice.tts import text_to_speech
+                while True:
+                    sentence_text = await tts_queue.get()
+                    if sentence_text is None:  # Sentinel
+                        tts_queue.task_done()
+                        break
+                    clean = sentence_text.strip()
+                    if clean:
+                        try:
+                            audio_bytes = await text_to_speech(clean)
+                            if audio_bytes:
+                                audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                                await websocket.send_json({"type": "audio", "data": audio_b64})
+                        except Exception as tts_exc:  # noqa: BLE001
+                            logger.warning("TTS chunk synthesis failed: %s", tts_exc)
+                    tts_queue.task_done()
 
-            async for token in engine.process_message_stream(conv_id, message, mode):
-                full_tokens.append(token)
-                await websocket.send_json({"type": "token", "content": token})
+            if tts_enabled:
+                tts_task = asyncio.create_task(_tts_worker())
 
-                if tts_enabled:
-                    sentence_buffer += token
+            def _is_valid_sentence_break(buf: str) -> bool:
+                stripped = buf.strip()
+                if not stripped:
+                    return False
+                words = stripped.split()
+                if not words:
+                    return False
+                last_w = words[-1].lower()
+                if last_w in ("e.g.", "i.e.", "mr.", "mrs.", "dr.", "vs.", "prof.", "inc.", "ltd."):
+                    return False
+                if len(stripped) >= 2 and stripped[-1] == "." and stripped[-2].isdigit():
+                    return False
+                return True
 
-                    # Ultra-fast first phrase dispatch (after comma or ~4 words) so audio starts under 200ms
-                    is_first_phrase = (
-                        not first_chunk_sent
-                        and any(sentence_buffer.endswith(p) for p in [", ", " - ", ": "])
-                        and len(sentence_buffer.split()) >= 3
-                    )
-                    is_sentence = any(
-                        sentence_buffer.endswith(p) for p in [". ", "? ", "! ", ".\n", "?\n", "!\n", "\n\n"]
-                    ) or (len(sentence_buffer) > 65 and sentence_buffer.endswith(" "))
+            try:
+                async for token in engine.process_message_stream(conv_id, message, mode):
+                    full_tokens.append(token)
+                    await websocket.send_json({"type": "token", "content": token})
 
-                    if is_first_phrase or is_sentence:
-                        first_chunk_sent = True
-                        sentence_to_send = sentence_buffer
-                        sentence_buffer = ""
-                        await _synthesize_and_send(sentence_to_send)
+                    if tts_enabled:
+                        sentence_buffer += token
+                        words = sentence_buffer.strip().split()
 
-            # Synthesize any trailing text
-            if tts_enabled and sentence_buffer.strip():
-                await _synthesize_and_send(sentence_buffer)
+                        # First phrase fast-dispatch (~3-5 words ending with comma, colon, or dash)
+                        # Allows audio to start playing in ~400ms before sentence 1 completes
+                        is_first_phrase = (
+                            not first_chunk_sent
+                            and len(words) >= 3
+                            and any(sentence_buffer.endswith(p) for p in [",", ":", " -", ";", ", ", ": "])
+                        )
+
+                        # Full sentence boundary: ends with '.', '?', '!', or '\n'
+                        is_sentence_end = (
+                            any(sentence_buffer.endswith(p) for p in [".", "?", "!", ".\n", "?\n", "!\n", "\n\n", ". ", "? ", "! "])
+                            and _is_valid_sentence_break(sentence_buffer)
+                            and len(words) >= 2
+                        )
+
+                        # Long sentence split (>= 16 words) on any natural pause
+                        is_long_split = len(words) >= 16 and any(sentence_buffer.endswith(p) for p in [",", ";", " ", "\n"])
+
+                        if is_first_phrase or is_sentence_end or is_long_split:
+                            first_chunk_sent = True
+                            to_queue = sentence_buffer
+                            sentence_buffer = ""
+                            await tts_queue.put(to_queue)
+
+                # Flush any trailing tokens to TTS queue
+                if tts_enabled and sentence_buffer.strip():
+                    await tts_queue.put(sentence_buffer)
+
+                # Await all queued audio chunks to finish synthesis
+                if tts_enabled and tts_task:
+                    await tts_queue.put(None)
+                    await tts_task
+
+            finally:
+                if tts_task and not tts_task.done():
+                    tts_task.cancel()
 
             await websocket.send_json({"type": "done", "conversation_id": conv_id})
 

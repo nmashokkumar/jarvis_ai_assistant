@@ -62,6 +62,8 @@ _NEGATIVE_PATTERNS = [
     "what is my name", "what's my name", "what can you do", "what are you",
     "how are you", "hello", "hey jarvis", "hi jarvis", "tell me a joke",
     "are you real", "are you human", "who made you", "who created you",
+    "what is your status", "how is your memory", "how are your systems",
+    "how do you feel", "are you online", "are you working", "how fast are you",
     "what is a reminder", "how to set a reminder", "what is a calendar",
     "how do calendars work", "how do reminders work",
 ]

@@ -233,7 +233,7 @@ class LLMClient(ILLMClient):
                 "max_tokens": 40,
                 "temperature": 0.1,
             }
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
                 res = await client.post(f"{self.llama_url}/chat/completions", json=payload)
                 if res.status_code == 200:
                     data = res.json()
@@ -250,9 +250,17 @@ class LLMClient(ILLMClient):
                                 func["arguments"] = {}
                     return msg
         except Exception as exc:
-            logger.info("llama-server tool call failed (%s), falling back to Ollama", exc)
+            logger.info("llama-server tool call failed (%s)", exc)
 
-        # 2. Secondary: Ollama Fallback
+        # 2. Secondary: Ollama Fallback (only if port is actually responsive)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(0.8)) as probe:
+                r = await probe.get(f"{self.ollama_url}/api/tags")
+                if r.status_code != 200:
+                    return None
+        except Exception:
+            return None
+
         try:
             payload = {
                 "model": self.ollama_model,
