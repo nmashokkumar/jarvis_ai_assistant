@@ -504,11 +504,7 @@ async def ws_live(websocket: WebSocket) -> None:
         nonlocal active_tts_task, tts_queue, turn_tool_name, turn_tool_result
         nonlocal turn_full_response_text, turn_assistant_msg_saved
         try:
-            # 1. Ensure conversation exists and save user message
-            await db.get_or_create_conversation(conv_id, mode)
-            await db.save_message(conv_id, "user", user_text)
-
-            # 2. Tool detection & execution
+            # 1. Tool detection & execution
             from tools.router import detect_tool, execute_tool
             from core.chat import calculate_num_predict
             tool_name, tool_params = detect_tool(user_text)
@@ -690,6 +686,10 @@ async def ws_live(websocket: WebSocket) -> None:
                 turn_conv_id = conv_id
                 turn_full_response_text = ""
                 turn_assistant_msg_saved = False
+
+                # Ensure conversation exists and commit user utterance to history
+                await db.get_or_create_conversation(conv_id, mode)
+                await db.save_message(conv_id, "user", raw_text)
 
                 logger.info("Live Voice Turn %d: '%s'", turn_id, raw_text)
                 await safe_send({"type": "state", "state": "thinking", "turn_id": turn_id})
