@@ -55,7 +55,7 @@ def get_whisper():
 
 def transcribe_audio_sync(audio_bytes: bytes) -> str:
     """
-    Decodes audio bytes (WebM, WAV, OGG, MP4, FLAC) and transcribes them to text using faster-whisper.
+    Decodes audio bytes (WAV, WebM, OGG, MP4, FLAC) and transcribes them to text using faster-whisper.
     """
     if not audio_bytes:
         return ""
@@ -64,7 +64,25 @@ def transcribe_audio_sync(audio_bytes: bytes) -> str:
     if model is None:
         raise RuntimeError("Whisper STT model not available")
 
-    # 1. Decode and resample to 16kHz mono float32 using PyAV
+    # Fast path: Native 16-bit PCM WAV (instant decode, 0.05ms)
+    if len(audio_bytes) > 44 and audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE":
+        try:
+            import wave
+            with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+                if wf.getsampwidth() == 2 and wf.getframerate() == 16000:
+                    raw_pcm = wf.readframes(wf.getnframes())
+                    int16_arr = np.frombuffer(raw_pcm, dtype=np.int16)
+                    float_arr = int16_arr.astype(np.float32) / 32768.0
+                    if wf.getnchannels() > 1:
+                        float_arr = float_arr.reshape(-1, wf.getnchannels()).mean(axis=1)
+
+                    if len(float_arr) > 0:
+                        segments, _ = model.transcribe(float_arr, beam_size=1, language="en")
+                        return " ".join(s.text.strip() for s in segments if s.text.strip()).strip()
+        except Exception as wav_err:
+            logger.debug("Fast-path WAV decode notice: %s, falling back to PyAV", wav_err)
+
+    # General path: PyAV for WebM, OGG, MP4, FLAC, etc.
     import av
     container = av.open(io.BytesIO(audio_bytes))
     stream = next((s for s in container.streams if s.type == "audio"), None)

@@ -1,9 +1,43 @@
 /**
  * JARVIS — silero_vad.js
  * Hybrid Voice Activity Detection (Dual Energy + Silero Neural VAD) via Web Audio.
- * Ensures zero-latency immediate voice detection from frame 1, with neural validation
- * for instant barge-in (<10ms) and robust silence endpointing (~850ms).
+ * Direct 16kHz Float32 PCM sample buffering + zero-dependency instant WAV encoding.
+ * Ensures pristine audio quality with 400ms pre-speech buffer and 100% valid headers every turn.
  */
+
+function float32ToWav(samples, sampleRate = 16000) {
+  const dataLength = samples.length * 2;
+  const buffer = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(buffer);
+
+  function writeString(offset, str) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataLength, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true); // SubChunk1Size (16 for PCM)
+  view.setUint16(20, 1, true);  // AudioFormat (1 = PCM)
+  view.setUint16(22, 1, true);  // NumChannels (1 = Mono)
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // ByteRate
+  view.setUint16(32, 2, true);  // BlockAlign
+  view.setUint16(34, 16, true); // BitsPerSample
+  writeString(36, 'data');
+  view.setUint32(40, dataLength, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
 
 class SileroVADManager {
   constructor({
@@ -14,7 +48,7 @@ class SileroVADManager {
     positiveSpeechThreshold = 0.45,
     negativeSpeechThreshold = 0.25,
     minSpeechFrames = 4,   // ~130ms minimum speech to trigger turn start
-    silenceFrames = 22     // ~700-850ms of silence to trigger turn completion
+    silenceFrames = 22     // ~700-800ms of silence to trigger turn completion
   } = {}) {
     this.onSpeechStart = onSpeechStart;
     this.onSpeechEnd = onSpeechEnd;
@@ -43,6 +77,14 @@ class SileroVADManager {
     this._isSpeaking = false;
     this._speechFrameCount = 0;
     this._silenceFrameCount = 0;
+
+    // Pre-speech rolling buffer (~400ms = 6400 samples at 16kHz)
+    this._preSpeechChunks = [];
+    this._preSpeechSamples = 0;
+    this._maxPreSpeechSamples = 6400;
+
+    // Active speech buffer
+    this._speechChunks = [];
 
     // Silero VAD state tensors
     this._h = null;
@@ -104,9 +146,16 @@ class SileroVADManager {
         this._srTensor = new ort.Tensor('int64', BigInt64Array.from([16000n]), [1]);
       } catch (_) {}
     }
+    this.resetTurn();
+  }
+
+  resetTurn() {
     this._isSpeaking = false;
     this._speechFrameCount = 0;
     this._silenceFrameCount = 0;
+    this._speechChunks = [];
+    this._preSpeechChunks = [];
+    this._preSpeechSamples = 0;
   }
 
   /**
@@ -166,8 +215,22 @@ class SileroVADManager {
         }
         const energyThreshold = Math.max(0.015, this._ambientRms * 2.6);
 
-        // 3. Resample to 16kHz for Silero neural VAD evaluation
+        // 3. Resample to 16kHz
         const resampled = this._resampleTo16k(inputData, sampleRate);
+
+        // 4. Buffer audio samples for crystal-clear non-clipped WAV generation
+        if (!this._isSpeaking) {
+          this._preSpeechChunks.push(resampled);
+          this._preSpeechSamples += resampled.length;
+          while (this._preSpeechSamples > this._maxPreSpeechSamples && this._preSpeechChunks.length > 1) {
+            const removed = this._preSpeechChunks.shift();
+            this._preSpeechSamples -= removed.length;
+          }
+        } else {
+          this._speechChunks.push(resampled);
+        }
+
+        // 5. Silero 512-frame chunking
         for (let i = 0; i < resampled.length; i++) {
           accumulated.push(resampled[i]);
           if (accumulated.length === 512) {
@@ -223,7 +286,6 @@ class SileroVADManager {
         if (results.cn) this._c = results.cn;
         if (results.stateN) this._h = results.stateN;
       } catch (e) {
-        // Fallback to energy detection
         prob = 0;
       }
     }
@@ -244,6 +306,10 @@ class SileroVADManager {
       if (!this._isSpeaking && this._speechFrameCount >= this.minSpeechFrames) {
         this._isSpeaking = true;
         console.log(`[SileroVAD] Speech Detected (rms: ${rms.toFixed(4)}, prob: ${prob.toFixed(2)})`);
+        // Transfer pre-speech buffer into active speech chunks
+        this._speechChunks = [...this._preSpeechChunks];
+        this._preSpeechChunks = [];
+        this._preSpeechSamples = 0;
         this.onSpeechStart?.();
       }
     } else {
@@ -254,7 +320,25 @@ class SileroVADManager {
           this._isSpeaking = false;
           this._silenceFrameCount = 0;
           console.log(`[SileroVAD] Silence Confirmed (~${Math.round(this.silenceFrames * 32)}ms) -> Finalizing turn`);
-          this.onSpeechEnd?.();
+
+          // Encode all accumulated Float32 PCM samples into a 16kHz mono WAV Blob
+          let wavBlob = null;
+          let totalLen = 0;
+          for (const c of this._speechChunks) totalLen += c.length;
+          if (totalLen >= 3200) { // >= 200ms
+            const merged = new Float32Array(totalLen);
+            let offset = 0;
+            for (const c of this._speechChunks) {
+              merged.set(c, offset);
+              offset += c.length;
+            }
+            wavBlob = float32ToWav(merged, 16000);
+          }
+
+          this._speechChunks = [];
+          this._preSpeechChunks = [];
+          this._preSpeechSamples = 0;
+          this.onSpeechEnd?.(wavBlob);
         }
       }
     }
@@ -277,9 +361,7 @@ class SileroVADManager {
 
   stop() {
     this.isListening = false;
-    this._isSpeaking = false;
-    this._speechFrameCount = 0;
-    this._silenceFrameCount = 0;
+    this.resetTurn();
 
     if (this._processor) {
       try { this._processor.disconnect(); } catch (_) {}

@@ -91,11 +91,11 @@ class LiveModeController {
           this.triggerBargeIn();
         }
       },
-      onSpeechEnd: () => {
+      onSpeechEnd: (wavBlob) => {
         if (!this.isActive || this.isMuted) return;
         if (this.state !== 'listening') return;
-        console.log('[LiveMode] VAD onSpeechEnd triggered');
-        this.commitUtterance();
+        console.log('[LiveMode] VAD onSpeechEnd triggered, wavBlob:', wavBlob ? wavBlob.size : 'none');
+        this.commitUtterance(wavBlob);
       },
     });
 
@@ -298,7 +298,7 @@ class LiveModeController {
     }
   }
 
-  commitUtterance() {
+  commitUtterance(wavBlob = null) {
     if (!this.isActive || this.isMuted) return;
     if (this.state !== 'listening') return;
 
@@ -314,10 +314,11 @@ class LiveModeController {
       console.log('[LiveMode] Submitting text utterance:', text);
       this._stt.stopListening();
       this._handleUserSpoke(text);
-    } else {
-      console.log('[LiveMode] Submitting audio utterance via server Whisper...');
-      this._handleAudioUtterance();
+      return;
     }
+
+    console.log('[LiveMode] Submitting audio utterance via server Whisper...');
+    this._handleAudioUtterance(wavBlob);
   }
 
   async enter() {
@@ -448,6 +449,7 @@ class LiveModeController {
     this._userSpeakingInTurn = false;
     this._pendingTranscript = '';
     this._lastSpokenText = '';
+    this._vad?.resetTurn?.();
     this.setState('listening');
     this._stt.startListening();
   }
@@ -461,12 +463,16 @@ class LiveModeController {
     }, delay);
   }
 
-  async _handleAudioUtterance() {
+  async _handleAudioUtterance(wavBlob = null) {
     if (!this.isActive || this.isMuted) return;
     this.setState('thinking');
     if (this.jarvisCaption) this.jarvisCaption.textContent = 'Processing speech...';
 
-    const blob = await this._stt.stopAndGetAudioBlob();
+    let blob = wavBlob;
+    if (!blob) {
+      blob = await this._stt.stopAndGetAudioBlob();
+    }
+
     if (!blob || blob.size < 1500) {
       console.log('[LiveMode] Audio chunk too small (' + (blob ? blob.size : 0) + ' bytes), resume listening');
       this.setState('listening');
@@ -474,6 +480,7 @@ class LiveModeController {
       return;
     }
 
+    console.log('[LiveMode] Captured pristine audio utterance:', blob.size, 'bytes. Dispatching to /ws/live');
     try {
       const b64 = await blobToBase64(blob);
       if (this.liveWs && this.liveWs.readyState === WebSocket.OPEN) {
@@ -488,7 +495,7 @@ class LiveModeController {
         }));
       } else {
         const fd = new FormData();
-        fd.append('file', blob, 'audio.webm');
+        fd.append('file', blob, 'audio.wav');
         const token = localStorage.getItem('jarvis_token') || 'jarvis123';
         const res = await fetch(`${CONFIG.getServerUrl()}/api/voice/transcribe?token=${encodeURIComponent(token)}`, {
           method: 'POST',
