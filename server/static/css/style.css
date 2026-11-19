@@ -1399,26 +1399,44 @@ body {
   transition: height 0.2s ease, background 0.3s ease;
 }
 
-/* State-Driven Orb Animations */
+/* State-Driven Orb Animations (Gemini / ChatGPT Live Style) */
+.live-orb {
+  transition: transform 0.12s cubic-bezier(0.2, 0.8, 0.3, 1), box-shadow 0.25s ease;
+}
+
+.live-orb.interrupted {
+  animation: orbFlash 0.35s ease-out !important;
+}
+
 .live-overlay[data-state="listening"] .halo-1 {
   animation: orbRipple 2.2s ease-out infinite;
+  border-color: rgba(0, 229, 255, 0.45);
 }
 .live-overlay[data-state="listening"] .halo-2 {
   animation: orbRipple 2.2s ease-out 1.1s infinite;
+  border-color: rgba(0, 229, 255, 0.3);
 }
 .live-overlay[data-state="listening"] .orb-eq-bars span {
   animation: eqListen 1.2s ease-in-out infinite;
+  background: var(--cyan-primary);
+  box-shadow: 0 0 10px var(--cyan-primary);
 }
 .live-overlay[data-state="listening"] .orb-eq-bars span:nth-child(2) { animation-delay: 0.15s; }
 .live-overlay[data-state="listening"] .orb-eq-bars span:nth-child(3) { animation-delay: 0.3s; }
 .live-overlay[data-state="listening"] .orb-eq-bars span:nth-child(4) { animation-delay: 0.15s; }
 
 .live-overlay[data-state="thinking"] .orb-core {
-  box-shadow: 0 0 50px rgba(255, 183, 3, 0.4), inset 0 0 25px rgba(255, 183, 3, 0.3);
+  box-shadow: 0 0 50px rgba(255, 183, 3, 0.5), inset 0 0 25px rgba(255, 183, 3, 0.35);
 }
 .live-overlay[data-state="thinking"] .orb-ring-outer {
   stroke: var(--amber-alert);
-  animation-duration: 3s;
+  animation: orbSpin 2s linear infinite;
+  transform-origin: center;
+}
+.live-overlay[data-state="thinking"] .orb-ring-mid {
+  stroke: #ff9e00;
+  animation: orbSpinReverse 3.2s linear infinite;
+  transform-origin: center;
 }
 .live-overlay[data-state="thinking"] .orb-eq-bars span {
   background: var(--amber-alert);
@@ -1427,24 +1445,40 @@ body {
 }
 
 .live-overlay[data-state="speaking"] .orb-core {
-  transform: scale(1.06);
-  box-shadow: 0 0 70px rgba(0, 229, 255, 0.65), inset 0 0 35px rgba(0, 229, 255, 0.45);
+  box-shadow: 0 0 75px rgba(0, 229, 255, 0.7), 0 0 130px rgba(0, 162, 255, 0.35), inset 0 0 35px rgba(0, 229, 255, 0.45);
 }
 .live-overlay[data-state="speaking"] .halo-1 {
-  animation: orbRipple 1.4s ease-out infinite;
+  animation: orbRipple 1.2s ease-out infinite;
+  border-color: rgba(0, 229, 255, 0.6);
+}
+.live-overlay[data-state="speaking"] .halo-2 {
+  animation: orbRipple 1.2s ease-out 0.6s infinite;
+  border-color: rgba(0, 162, 255, 0.4);
 }
 .live-overlay[data-state="speaking"] .orb-eq-bars span {
-  animation: eqSpeak 0.55s ease-in-out infinite alternate;
+  background: #fff;
+  box-shadow: 0 0 12px var(--cyan-primary), 0 0 20px rgba(0, 229, 255, 0.8);
 }
-.live-overlay[data-state="speaking"] .orb-eq-bars span:nth-child(1) { animation-delay: 0.1s; }
-.live-overlay[data-state="speaking"] .orb-eq-bars span:nth-child(2) { animation-delay: 0.25s; }
-.live-overlay[data-state="speaking"] .orb-eq-bars span:nth-child(3) { animation-delay: 0.05s; }
-.live-overlay[data-state="speaking"] .orb-eq-bars span:nth-child(4) { animation-delay: 0.35s; }
-.live-overlay[data-state="speaking"] .orb-eq-bars span:nth-child(5) { animation-delay: 0.2s; }
 
 .live-overlay[data-state="paused"] .orb-core {
-  opacity: 0.5;
+  opacity: 0.4;
   box-shadow: none;
+}
+
+@keyframes orbSpin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+@keyframes orbSpinReverse {
+  0% { transform: rotate(360deg); }
+  100% { transform: rotate(0deg); }
+}
+
+@keyframes orbFlash {
+  0% { filter: brightness(2) drop-shadow(0 0 50px #ffffff); transform: scale(1.12); }
+  50% { filter: brightness(1.5) drop-shadow(0 0 25px var(--cyan-primary)); }
+  100% { filter: brightness(1) drop-shadow(0 0 10px var(--cyan-primary)); transform: scale(1); }
 }
 
 @keyframes orbRipple {

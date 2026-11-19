@@ -406,6 +406,343 @@ async def ws_chat(websocket: WebSocket) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Full-Duplex Live Voice WebSocket (/ws/live)
+# Low-Latency Chunked Streaming + Real-time Interruption (Barge-In)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.websocket("/ws/live")
+async def ws_live(websocket: WebSocket) -> None:
+    """
+    Persistent full-duplex Live Voice session endpoint.
+    Handles concurrent upstream (utterance, chunk_played, interrupt) and
+    downstream (tokens, state events, 24kHz raw PCM s16le chunks).
+    """
+    token = websocket.query_params.get("token") or websocket.headers.get("Authorization", "").replace("Bearer ", "")
+    if not verify_token(token):
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    logger.info("Live Voice WebSocket client connected (/ws/live)")
+
+    send_lock = asyncio.Lock()
+
+    async def safe_send(payload: dict) -> bool:
+        try:
+            async with send_lock:
+                await websocket.send_json(payload)
+            return True
+        except Exception:
+            return False
+
+    session_id = str(uuid.uuid4())
+    active_turn_id: int = 0
+    active_gen_task: Optional[asyncio.Task] = None
+    active_tts_task: Optional[asyncio.Task] = None
+    tts_queue: Optional[asyncio.Queue] = None
+
+    # History & chunk playback accounting
+    spoken_sentences: dict[int, str] = {}  # chunk_id -> clean sentence
+    confirmed_chunks: set[int] = set()     # chunk_ids played by client
+    turn_user_text: str = ""
+    turn_conv_id: str = session_id
+    turn_tool_name: Optional[str] = None
+    turn_tool_result: Optional[str] = None
+    turn_full_response_text: str = ""
+    turn_assistant_msg_saved: bool = False
+
+    async def abort_active_turn(interrupted_turn_id: int, client_confirmed: Optional[list[int]] = None) -> None:
+        """Cancel active tasks, clear queues, and commit only confirmed spoken sentences to SQLite."""
+        nonlocal active_gen_task, active_tts_task, tts_queue, turn_assistant_msg_saved
+
+        if client_confirmed:
+            for cid in client_confirmed:
+                confirmed_chunks.add(int(cid))
+
+        # 1. Cancel running generation and TTS tasks
+        if active_gen_task and not active_gen_task.done():
+            active_gen_task.cancel()
+        if active_tts_task and not active_tts_task.done():
+            active_tts_task.cancel()
+
+        # 2. Drain pending TTS queue
+        if tts_queue:
+            while not tts_queue.empty():
+                try:
+                    tts_queue.get_nowait()
+                    tts_queue.task_done()
+                except Exception:
+                    break
+
+        # 3. Commit ONLY the confirmed played sentences to DB
+        if not turn_assistant_msg_saved and turn_conv_id:
+            played_pieces = [spoken_sentences[cid] for cid in sorted(confirmed_chunks) if cid in spoken_sentences]
+            confirmed_text = " ".join(played_pieces).strip()
+            if confirmed_text:
+                turn_assistant_msg_saved = True
+                logger.info(
+                    "[Live Interruption] Turn %d interrupted. Saving only confirmed spoken text (%d words): '%s'",
+                    interrupted_turn_id, len(confirmed_text.split()), confirmed_text
+                )
+                await db.save_message(
+                    turn_conv_id,
+                    "assistant",
+                    confirmed_text,
+                    tool_used=turn_tool_name,
+                    tool_result=turn_tool_result,
+                )
+                asyncio.create_task(
+                    engine.memory.extract_and_save_memories(turn_user_text, confirmed_text, db)
+                )
+            else:
+                logger.info(
+                    "[Live Interruption] Turn %d interrupted before any audio chunk finished playing. No assistant message saved.",
+                    interrupted_turn_id
+                )
+
+    async def run_turn_generator(turn_id: int, user_text: str, conv_id: str, mode: str):
+        nonlocal active_tts_task, tts_queue, turn_tool_name, turn_tool_result
+        nonlocal turn_full_response_text, turn_assistant_msg_saved
+        try:
+            # 1. Ensure conversation exists and save user message
+            await db.get_or_create_conversation(conv_id, mode)
+            await db.save_message(conv_id, "user", user_text)
+
+            # 2. Tool detection & execution
+            from tools.router import detect_tool, execute_tool
+            from core.chat import calculate_num_predict
+            tool_name, tool_params = detect_tool(user_text)
+            tool_result = None
+
+            if tool_name:
+                if tool_name == "web_search":
+                    resolved_info = await engine._resolve_search_query(
+                        conv_id, user_text, tool_params.get("query")
+                    )
+                    tool_params["query"] = resolved_info["query"]
+                    tool_params["category"] = resolved_info.get("category", "text")
+                    tool_params["timelimit"] = resolved_info.get("timelimit")
+
+                try:
+                    tool_result = await execute_tool(tool_name, tool_params, user_text, db)
+                except Exception as exc:
+                    logger.warning("Live tool %s failed: %s", tool_name, exc)
+                    tool_result = f"Tool error: {exc}"
+
+            turn_tool_name = tool_name
+            turn_tool_result = tool_result
+
+            # 3. Assemble prompt
+            messages = await engine._build_messages(
+                conv_id, user_text, mode, tool_name, tool_result
+            )
+
+            # 4. Setup concurrent Kokoro PCM TTS Worker
+            tts_queue = asyncio.Queue()
+            from voice.tts import text_to_pcm, strip_for_tts
+
+            async def _live_tts_worker():
+                first_chunk = True
+                while True:
+                    item = await tts_queue.get()
+                    if item is None:
+                        tts_queue.task_done()
+                        break
+                    chunk_id, clean_text = item
+                    try:
+                        if turn_id != active_turn_id:
+                            tts_queue.task_done()
+                            break
+                        pcm_bytes = await text_to_pcm(clean_text)
+                        if pcm_bytes and turn_id == active_turn_id:
+                            spoken_sentences[chunk_id] = clean_text
+                            pcm_b64 = base64.b64encode(pcm_bytes).decode("ascii")
+                            if first_chunk:
+                                first_chunk = False
+                                await safe_send({"type": "state", "state": "speaking", "turn_id": turn_id})
+                            await safe_send({
+                                "type": "pcm_chunk",
+                                "turn_id": turn_id,
+                                "chunk_id": chunk_id,
+                                "text": clean_text,
+                                "audio": pcm_b64,
+                                "sample_rate": 24000,
+                            })
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as err:
+                        logger.warning("TTS chunk %d error: %s", chunk_id, err)
+                    finally:
+                        tts_queue.task_done()
+
+            active_tts_task = asyncio.create_task(_live_tts_worker())
+
+            # 5. Stream LLM tokens and split by sentence
+            num_predict = calculate_num_predict(user_text, tool_name)
+            parts: list[str] = []
+            sentence_buffer = ""
+            chunk_counter = 0
+            first_chunk_sent = False
+
+            def _is_valid_sentence_break(buf: str) -> bool:
+                stripped = buf.strip()
+                if not stripped:
+                    return False
+                words = stripped.split()
+                if not words:
+                    return False
+                last_w = words[-1].lower()
+                if last_w in ("e.g.", "i.e.", "mr.", "mrs.", "dr.", "vs.", "prof.", "inc.", "ltd."):
+                    return False
+                if len(stripped) >= 2 and stripped[-1] == "." and stripped[-2].isdigit():
+                    return False
+                return True
+
+            async for token in llm.chat_stream(messages, mode, num_predict=num_predict):
+                if turn_id != active_turn_id:
+                    break
+                parts.append(token)
+                await safe_send({"type": "token", "content": token, "turn_id": turn_id})
+
+                sentence_buffer += token
+                words = sentence_buffer.strip().split()
+
+                # Fast first-phrase dispatch (3-5 words ending with comma, colon, dash)
+                is_first_phrase = (
+                    not first_chunk_sent
+                    and len(words) >= 3
+                    and any(sentence_buffer.endswith(p) for p in [",", ":", " -", ";", ", ", ": "])
+                )
+                # Sentence boundary: ends with '.', '?', '!', '\n'
+                is_sentence_end = (
+                    any(sentence_buffer.endswith(p) for p in [".", "?", "!", ".\n", "?\n", "!\n", "\n\n", ". ", "? ", "! "])
+                    and _is_valid_sentence_break(sentence_buffer)
+                    and len(words) >= 2
+                )
+                # Long clause break (>= 16 words)
+                is_long_split = len(words) >= 16 and any(sentence_buffer.endswith(p) for p in [",", ";", " ", "\n"])
+
+                if is_first_phrase or is_sentence_end or is_long_split:
+                    clean_chunk = strip_for_tts(sentence_buffer)
+                    sentence_buffer = ""
+                    if clean_chunk:
+                        first_chunk_sent = True
+                        await tts_queue.put((chunk_counter, clean_chunk))
+                        chunk_counter += 1
+
+            # Flush remaining buffer
+            if sentence_buffer.strip():
+                clean_chunk = strip_for_tts(sentence_buffer)
+                if clean_chunk:
+                    await tts_queue.put((chunk_counter, clean_chunk))
+                    chunk_counter += 1
+
+            turn_full_response_text = "".join(parts).strip()
+
+            # Finish TTS
+            if active_tts_task and not active_tts_task.done():
+                await tts_queue.put(None)
+                await active_tts_task
+
+            # Notify client turn generation finished
+            await safe_send({
+                "type": "turn_complete",
+                "turn_id": turn_id,
+                "total_chunks": chunk_counter,
+                "text": turn_full_response_text,
+            })
+
+            # If no audio chunks were generated (empty reply), return to listening
+            if chunk_counter == 0 and turn_id == active_turn_id:
+                await safe_send({"type": "state", "state": "listening", "turn_id": turn_id})
+
+        except asyncio.CancelledError:
+            logger.info("Live turn %d task cancelled", turn_id)
+            if active_tts_task and not active_tts_task.done():
+                active_tts_task.cancel()
+            raise
+        except Exception as exc:
+            logger.error("Live turn %d pipeline error: %s", turn_id, exc, exc_info=True)
+            await safe_send({"type": "error", "message": str(exc), "turn_id": turn_id})
+            await safe_send({"type": "state", "state": "listening", "turn_id": turn_id})
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type", "")
+
+            if msg_type == "utterance":
+                raw_text = data.get("text", "").strip()
+                if not raw_text:
+                    continue
+                turn_id = data.get("turn_id", active_turn_id + 1)
+                conv_id = data.get("conversation_id") or session_id
+                mode = data.get("mode", "regular")
+
+                # Abort any in-flight turn
+                await abort_active_turn(active_turn_id)
+
+                # Initialize new turn state
+                active_turn_id = turn_id
+                spoken_sentences.clear()
+                confirmed_chunks.clear()
+                turn_user_text = raw_text
+                turn_conv_id = conv_id
+                turn_full_response_text = ""
+                turn_assistant_msg_saved = False
+
+                logger.info("Live Voice Turn %d: '%s'", turn_id, raw_text)
+                await safe_send({"type": "state", "state": "thinking", "turn_id": turn_id})
+                active_gen_task = asyncio.create_task(
+                    run_turn_generator(turn_id, raw_text, conv_id, mode)
+                )
+
+            elif msg_type == "chunk_played":
+                t_id = data.get("turn_id")
+                c_id = data.get("chunk_id")
+                if t_id == active_turn_id and c_id is not None:
+                    confirmed_chunks.add(int(c_id))
+
+            elif msg_type == "playback_finished":
+                t_id = data.get("turn_id")
+                if t_id == active_turn_id:
+                    # Normal completion without interruption!
+                    if not turn_assistant_msg_saved and turn_full_response_text and turn_conv_id:
+                        turn_assistant_msg_saved = True
+                        logger.info("Live Voice Turn %d: Normal playback finished. Committing full response.", t_id)
+                        await db.save_message(
+                            turn_conv_id,
+                            "assistant",
+                            turn_full_response_text,
+                            tool_used=turn_tool_name,
+                            tool_result=turn_tool_result,
+                        )
+                        asyncio.create_task(
+                            engine.memory.extract_and_save_memories(
+                                turn_user_text, turn_full_response_text, db
+                            )
+                        )
+                    await safe_send({"type": "state", "state": "listening", "turn_id": t_id})
+
+            elif msg_type == "interrupt":
+                t_id = data.get("turn_id", active_turn_id)
+                confirmed = data.get("confirmed_chunks", [])
+                logger.info("Live Voice Turn %d: User barge-in interrupt received!", t_id)
+                await abort_active_turn(t_id, confirmed)
+                await safe_send({"type": "state", "state": "listening", "turn_id": t_id, "interrupted": True})
+
+            elif msg_type == "ping":
+                await safe_send({"type": "pong"})
+
+    except WebSocketDisconnect:
+        logger.info("Live Voice WebSocket client disconnected")
+    except Exception as exc:
+        logger.error("Live Voice WebSocket error: %s", exc)
+    finally:
+        await abort_active_turn(active_turn_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Conversations
 # ─────────────────────────────────────────────────────────────────────────────
 

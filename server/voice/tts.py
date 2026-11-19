@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MD_PATTERNS = [
+    # URLs
+    (re.compile(r"https?://\S+|www\.\S+"), ""),
+    # Emojis & pictographs
+    (re.compile(r"[\U00010000-\U0010ffff]"), ""),
+    (re.compile(r"[\u2600-\u27bf]"), ""),
+    # Markdown formatting
     (re.compile(r"\*\*(.+?)\*\*"), r"\1"),          # **bold**
     (re.compile(r"\*(.+?)\*"), r"\1"),               # *italic*
     (re.compile(r"__(.+?)__"), r"\1"),               # __bold__
@@ -29,18 +35,25 @@ _MD_PATTERNS = [
     (re.compile(r"^#{1,6}\s+", re.MULTILINE), ""),  # ## headings
     (re.compile(r"!\[.*?\]\(.*?\)"), ""),            # ![img](url)
     (re.compile(r"\[(.+?)\]\(.+?\)"), r"\1"),        # [text](url)
-    (re.compile(r"^\s*[-*+]\s+", re.MULTILINE), ""),# list bullets
-    (re.compile(r"^\s*\d+\.\s+", re.MULTILINE), ""),# numbered lists
-    (re.compile(r"\n{2,}"), " "),                    # collapse blank lines
+    (re.compile(r"^\s*[-*+•]\s+", re.MULTILINE), ""),# list bullets
+    (re.compile(r"^\s*\d+\.\s+", re.MULTILINE), ""), # numbered lists
+    (re.compile(r"<[^>]+>"), ""),                    # HTML tags
+    (re.compile(r"[#*~`><]"), " "),                  # raw formatting symbols
+    (re.compile(r"\n+"), " "),                       # collapse newlines
     (re.compile(r"\s+"), " "),                       # normalise whitespace
 ]
 
 
-def strip_markdown(text: str) -> str:
-    """Remove markdown formatting so TTS reads clean prose."""
+def strip_for_tts(text: str) -> str:
+    """Remove markdown formatting, URLs, bullet symbols, and emojis so TTS reads clean prose."""
     for pattern, replacement in _MD_PATTERNS:
         text = pattern.sub(replacement, text)
     return text.strip()
+
+
+def strip_markdown(text: str) -> str:
+    """Backwards-compatible alias for strip_for_tts."""
+    return strip_for_tts(text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,6 +116,19 @@ def _synthesize_kokoro_sync(clean_text: str, voice_name: str) -> bytes:
     return buf.getvalue()
 
 
+def _synthesize_kokoro_pcm_sync(clean_text: str, voice_name: str) -> bytes:
+    kokoro = _get_kokoro()
+    if kokoro is None:
+        raise RuntimeError("Kokoro engine not available")
+
+    import numpy as np
+    samples, sample_rate = kokoro.create(clean_text, voice=voice_name, speed=1.0, lang="en-us")
+    # kokoro outputs float32 at 24,000 Hz mono
+    # Quantize float32 [-1.0, 1.0] to int16 [-32768, 32767] little-endian
+    int16_samples = np.clip(samples * 32767.0, -32768.0, 32767.0).astype(np.int16)
+    return int16_samples.tobytes()
+
+
 async def _synthesize_edge_tts(clean_text: str, voice_name: str) -> bytes:
     import edge_tts
     buffer = io.BytesIO()
@@ -116,6 +142,47 @@ async def _synthesize_edge_tts(clean_text: str, voice_name: str) -> bytes:
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
+
+async def text_to_pcm(text: str, voice: str | None = None) -> bytes:
+    """
+    Synthesize text into raw, headerless 24,000 Hz, mono, 16-bit signed little-endian (s16le) PCM bytes.
+    Markdown, emojis, and URLs are automatically stripped.
+    """
+    clean_text = strip_for_tts(text)
+    if not clean_text:
+        return b""
+
+    # Primary path: Kokoro ONNX (running locally on server CPU)
+    if getattr(settings, "TTS_ENGINE", "kokoro").lower() == "kokoro":
+        try:
+            kokoro_voice = voice or getattr(settings, "KOKORO_VOICE", "af_heart")
+            loop = asyncio.get_running_loop()
+            pcm_bytes = await loop.run_in_executor(None, _synthesize_kokoro_pcm_sync, clean_text, kokoro_voice)
+            if pcm_bytes:
+                return pcm_bytes
+        except Exception as exc:
+            logger.warning("Kokoro local PCM synthesis failed (%s), falling back to Edge TTS", exc)
+
+    # Fallback via Edge TTS + soundfile decode to 24kHz mono PCM
+    try:
+        import soundfile as sf
+        import numpy as np
+        edge_voice = voice or settings.TTS_VOICE
+        mp3_bytes = await _synthesize_edge_tts(clean_text, edge_voice)
+        if mp3_bytes:
+            data, sr = sf.read(io.BytesIO(mp3_bytes))
+            if len(data.shape) > 1:
+                data = data.mean(axis=1)  # Mono
+            if sr != 24000:
+                indices = np.round(np.arange(0, len(data), sr / 24000.0)).astype(int)
+                indices = indices[indices < len(data)]
+                data = data[indices]
+            int16_data = np.clip(data * 32767.0, -32768.0, 32767.0).astype(np.int16)
+            return int16_data.tobytes()
+    except Exception as fallback_exc:
+        logger.error("Edge TTS fallback to PCM failed: %s", fallback_exc)
+
+    return b""
 
 async def text_to_speech(text: str, voice: str | None = None) -> bytes:
     """

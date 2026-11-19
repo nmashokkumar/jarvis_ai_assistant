@@ -4,6 +4,166 @@
  */
 
 // ---------------------------------------------------------------------------
+// LiveAudioQueue — Full-Duplex Web Audio API Scheduled Raw PCM (24kHz s16le)
+// Gapless continuous streaming + instant <10ms barge-in interruption
+// ---------------------------------------------------------------------------
+class LiveAudioQueue {
+  constructor({ onChunkPlayed, onPlayStart, onPlayEnd, onAudioLevel } = {}) {
+    this.onChunkPlayed = onChunkPlayed || null;
+    this.onPlayStart = onPlayStart || null;
+    this.onPlayEnd = onPlayEnd || null;
+    this.onAudioLevel = onAudioLevel || null;
+
+    this.ctx = null;
+    this.analyser = null;
+    this.nextStartTime = 0;
+    this.activeSources = new Set();
+    this.isPlaying = false;
+    this.currentTurnId = 0;
+    this.confirmedChunks = new Set();
+    this._animId = null;
+  }
+
+  initContext() {
+    if (!this.ctx || this.ctx.state === 'closed') {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      try {
+        this.ctx = new AudioCtx({ sampleRate: 24000 });
+      } catch (_) {
+        this.ctx = new AudioCtx();
+      }
+      this.analyser = this.ctx.createAnalyser();
+      this.analyser.fftSize = 64;
+      this.analyser.smoothingTimeConstant = 0.5;
+      this.analyser.connect(this.ctx.destination);
+    }
+    if (this.ctx && this.ctx.state === 'suspended') {
+      this.ctx.resume().catch(() => {});
+    }
+    return this.ctx;
+  }
+
+  unlock() {
+    this.initContext();
+  }
+
+  startTurn(turnId) {
+    this.currentTurnId = turnId;
+    this.confirmedChunks.clear();
+    const ctx = this.initContext();
+    this.nextStartTime = ctx.currentTime;
+  }
+
+  enqueuePcmChunk(turnId, chunkId, base64Pcm, sampleRate = 24000) {
+    // Drop late-arriving packets from stale / interrupted turns
+    if (turnId !== this.currentTurnId) {
+      console.log(`[LiveAudioQueue] Dropping stale chunk ${chunkId} for turn ${turnId} (active: ${this.currentTurnId})`);
+      return;
+    }
+
+    const ctx = this.initContext();
+    const binary = atob(base64Pcm);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+
+    // Convert 16-bit signed little-endian PCM to 32-bit float [-1.0, 1.0]
+    const int16Count = Math.floor(len / 2);
+    const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, int16Count);
+    const buffer = ctx.createBuffer(1, int16Count, sampleRate);
+    const channelData = buffer.getChannelData(0);
+    for (let i = 0; i < int16Count; i++) {
+      channelData[i] = int16[i] / 32768.0;
+    }
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    if (this.analyser) {
+      source.connect(this.analyser);
+    } else {
+      source.connect(ctx.destination);
+    }
+
+    const now = ctx.currentTime;
+    const startTime = Math.max(now, this.nextStartTime);
+    source.start(startTime);
+    this.nextStartTime = startTime + buffer.duration;
+    this.activeSources.add(source);
+
+    if (!this.isPlaying) {
+      this.isPlaying = true;
+      this.onPlayStart?.();
+      this._startVisualizer();
+    }
+
+    source.onended = () => {
+      this.activeSources.delete(source);
+      if (turnId === this.currentTurnId) {
+        this.confirmedChunks.add(chunkId);
+        this.onChunkPlayed?.(turnId, chunkId);
+      }
+      if (this.activeSources.size === 0) {
+        this.isPlaying = false;
+        this._stopVisualizer();
+        this.onPlayEnd?.(turnId);
+      }
+    };
+  }
+
+  stop() {
+    this.activeSources.forEach(src => {
+      try {
+        src.onended = null;
+        src.stop();
+      } catch (_) {}
+    });
+    this.activeSources.clear();
+    this.isPlaying = false;
+    this._stopVisualizer();
+    if (this.ctx) {
+      this.nextStartTime = this.ctx.currentTime;
+    }
+  }
+
+  interrupt() {
+    const played = Array.from(this.confirmedChunks);
+    this.currentTurnId++; // Invalidate stale packets
+    this.stop();
+    return played;
+  }
+
+  _startVisualizer() {
+    if (this._animId) return;
+    const data = new Uint8Array(this.analyser ? this.analyser.frequencyBinCount : 0);
+    const loop = () => {
+      if (!this.isPlaying) {
+        this._animId = null;
+        return;
+      }
+      if (this.analyser) {
+        this.analyser.getByteFrequencyData(data);
+        let sum = 0;
+        for (let i = 0; i < data.length; i++) sum += data[i];
+        const avg = sum / (data.length * 255.0);
+        this.onAudioLevel?.(avg);
+      }
+      this._animId = requestAnimationFrame(loop);
+    };
+    this._animId = requestAnimationFrame(loop);
+  }
+
+  _stopVisualizer() {
+    if (this._animId) {
+      cancelAnimationFrame(this._animId);
+      this._animId = null;
+    }
+    this.onAudioLevel?.(0);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // AudioPlayer — plays base64-encoded MP3 from server TTS
 // ---------------------------------------------------------------------------
 class AudioPlayer {

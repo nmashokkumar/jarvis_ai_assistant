@@ -13,10 +13,13 @@ class LiveModeController {
     this.isActive = false;
     this.isMuted = false;
     this.state = 'idle'; // 'idle' | 'listening' | 'thinking' | 'speaking' | 'paused'
+    this.turnId = 0;
+    this.liveWs = null;
     this._pendingTranscript = '';
     this._currentReplyText = '';
-    this._awaitingAudioForTurn = false;
     this._restartTimer = null;
+    this._silenceTimer = null;
+    this._lastSpokenText = '';
 
     // DOM references
     this.overlay = document.getElementById('live-overlay');
@@ -28,28 +31,62 @@ class LiveModeController {
     this.muteBtn = document.getElementById('live-mute-btn');
     this.endBtn = document.getElementById('live-end-btn');
 
-    this._silenceTimer = null;
-    this._lastSpokenText = '';
-
-    // Neural Silero VAD Manager for Instant Barge-In (Interruption)
-    this._vad = new SileroVADManager({
-      positiveSpeechThreshold: 0.5,
-      negativeSpeechThreshold: 0.35,
-      onSpeechStart: () => {
-        if (!this.isActive || this.isMuted) return;
-        // If Jarvis is currently speaking, Boss spoke -> INTERRUPT IMMEDIATELY!
-        if (this.state === 'speaking' || this.app.audioPlayer.isPlaying) {
-          console.log('[LiveMode] Silero VAD detected user speech during playback -> Cutting off Jarvis audio!');
-          this.app.audioPlayer.stop();
+    // Web Audio API Scheduled Buffer Queue for 24kHz Raw PCM s16le
+    this.liveAudioQueue = new LiveAudioQueue({
+      onChunkPlayed: (turnId, chunkId) => {
+        if (this.liveWs && this.liveWs.readyState === WebSocket.OPEN) {
+          this.liveWs.send(JSON.stringify({
+            type: 'chunk_played',
+            turn_id: turnId,
+            chunk_id: chunkId,
+          }));
+        }
+      },
+      onPlayStart: () => {
+        if (this.isActive) this.setState('speaking');
+      },
+      onPlayEnd: (turnId) => {
+        if (this.liveWs && this.liveWs.readyState === WebSocket.OPEN) {
+          this.liveWs.send(JSON.stringify({
+            type: 'playback_finished',
+            turn_id: turnId,
+          }));
+        }
+        if (this.isActive && !this.isMuted) {
           this.setState('listening');
           this.startListening();
         }
       },
+      onAudioLevel: (level) => {
+        if (this.state === 'speaking') {
+          this._updateOrbAudioReaction(level, 'speaking');
+        }
+      },
+    });
+
+    // Neural Silero VAD Manager for Instant Barge-In (<10ms) & Silence Endpointing
+    this._vad = new SileroVADManager({
+      positiveSpeechThreshold: 0.5,
+      negativeSpeechThreshold: 0.35,
+      minSpeechFrames: 8, // ~256ms of continuous speech
+      redemptionFrames: 25, // ~800ms of real silence
+      onAudioLevel: (rms) => {
+        if (this.state === 'listening') {
+          this._updateOrbAudioReaction(rms, 'listening');
+        }
+      },
+      onSpeechStart: () => {
+        if (!this.isActive || this.isMuted) return;
+        // If JARVIS is speaking or playing audio -> INSTANT BARGE-IN!
+        if (this.state === 'speaking' || this.liveAudioQueue.isPlaying) {
+          console.log('[LiveMode] Silero VAD detected user speech during playback -> Triggering instant barge-in!');
+          this.triggerBargeIn();
+        }
+      },
       onSpeechEnd: () => {
         if (!this.isActive || this.isMuted) return;
-        // When Silero VAD confirms voice stopped, trigger fast STT flush if text exists
+        // Voice ended -> dispatch query
         if (this.state === 'listening' && this._lastSpokenText) {
-          console.log('[LiveMode] Silero VAD confirmed silence -> Dispatching query to Boss assistant.');
           const toSend = this._lastSpokenText;
           this._lastSpokenText = '';
           clearTimeout(this._silenceTimer);
@@ -57,13 +94,13 @@ class LiveModeController {
           this._stt.stopListening();
           this._handleUserSpoke(toSend);
         }
-      }
+      },
     });
 
     // Dedicated SpeechRecognition instance for Live Mode with smart fast-endpointing
     this._stt = new SpeechRecognitionManager({
       onStart: () => {
-        if (this.isActive && !this.isMuted) {
+        if (this.isActive && !this.isMuted && this.state !== 'speaking' && this.state !== 'thinking') {
           this.setState('listening');
         }
       },
@@ -74,9 +111,8 @@ class LiveModeController {
         }
         if (text) {
           this._lastSpokenText = text;
-          // Natural conversational pause: give 1.2s of real pause so Boss can breathe & speak naturally
+          // Natural conversational pause: 1.1s
           clearTimeout(this._silenceTimer);
-          const delay = 1200;
           this._silenceTimer = setTimeout(() => {
             if (this.isActive && this.state === 'listening' && this._lastSpokenText) {
               const toSend = this._lastSpokenText;
@@ -85,7 +121,7 @@ class LiveModeController {
               this._stt.stopListening();
               this._handleUserSpoke(toSend);
             }
-          }, delay);
+          }, 1100);
         }
       },
       onEnd: () => {
@@ -97,7 +133,6 @@ class LiveModeController {
         if (text && this.state === 'listening') {
           this._handleUserSpoke(text);
         } else if (!this.isMuted && this.state === 'listening') {
-          // Keep listening smoothly without user having to re-trigger
           this._scheduleListenRestart(200);
         }
       },
@@ -112,9 +147,8 @@ class LiveModeController {
           this._scheduleListenRestart(350);
         } else if (err !== 'aborted' && err !== 'no-speech') {
           console.warn('[LiveMode STT] error:', err);
-          this.setState('paused');
         }
-      }
+      },
     });
 
     this._bindEvents();
@@ -125,12 +159,8 @@ class LiveModeController {
     if (this.orb) {
       this.orb.addEventListener('click', () => {
         if (!this.isActive) return;
-        if (this.state === 'speaking') {
-          // Interrupt Jarvis mid-sentence and immediately listen to Boss
-          this.app.audioPlayer.stop();
-          this.isMuted = false;
-          this._updateMuteBtn();
-          this.startListening();
+        if (this.state === 'speaking' || this.liveAudioQueue.isPlaying) {
+          this.triggerBargeIn();
         } else if (this.state === 'paused') {
           this.isMuted = false;
           this._updateMuteBtn();
@@ -150,6 +180,95 @@ class LiveModeController {
     }
   }
 
+  triggerBargeIn() {
+    // 1. Instant client flush (<10ms): stop all playing buffers, clear queue, invalidate turn
+    const confirmed = this.liveAudioQueue.interrupt();
+    this.setState('listening');
+
+    // Visual flash on orb for tactile Gemini/ChatGPT style reaction
+    if (this.orb) {
+      this.orb.classList.remove('interrupted');
+      void this.orb.offsetWidth;
+      this.orb.classList.add('interrupted');
+    }
+
+    // 2. Signal server to cancel LLM generation and Kokoro TTS tasks
+    if (this.liveWs && this.liveWs.readyState === WebSocket.OPEN) {
+      this.liveWs.send(JSON.stringify({
+        type: 'interrupt',
+        turn_id: this.turnId,
+        confirmed_chunks: confirmed,
+      }));
+    }
+
+    // 3. Keep listening for Boss's new utterance
+    this.startListening();
+  }
+
+  connectLiveWs() {
+    if (this.liveWs && (this.liveWs.readyState === WebSocket.OPEN || this.liveWs.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    const wsUrl = `${CONFIG.getWsUrl('/ws/live')}?token=${encodeURIComponent(this.app.token)}`;
+    try {
+      this.liveWs = new WebSocket(wsUrl);
+
+      this.liveWs.onopen = () => {
+        console.log('[LiveMode] WebSocket connected to /ws/live');
+        if (this.connectionNote) this.connectionNote.classList.add('hidden');
+      };
+
+      this.liveWs.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          this.handleLiveMessage(data);
+        } catch (err) {
+          console.error('[LiveMode] Failed to parse message:', err);
+        }
+      };
+
+      this.liveWs.onclose = () => {
+        console.log('[LiveMode] WebSocket disconnected from /ws/live');
+        if (this.isActive && this.connectionNote) {
+          this.connectionNote.classList.remove('hidden');
+        }
+      };
+
+      this.liveWs.onerror = (e) => {
+        console.warn('[LiveMode] WebSocket error:', e);
+      };
+    } catch (err) {
+      console.error('[LiveMode] WebSocket connection exception:', err);
+    }
+  }
+
+  handleLiveMessage(data) {
+    switch (data.type) {
+      case 'state':
+        this.setState(data.state);
+        break;
+
+      case 'token':
+        this.onToken(data.content);
+        break;
+
+      case 'pcm_chunk':
+        // Full-duplex raw 24kHz s16le PCM streaming
+        this.setState('speaking');
+        this.liveAudioQueue.enqueuePcmChunk(data.turn_id, data.chunk_id, data.audio, data.sample_rate || 24000);
+        break;
+
+      case 'turn_complete':
+        console.log(`[LiveMode] Turn ${data.turn_id} generation complete (${data.total_chunks} chunks).`);
+        break;
+
+      case 'error':
+        showToast(data.message || 'Error during live turn', 'error');
+        this.setState('listening');
+        break;
+    }
+  }
+
   enter() {
     if (!this._stt.supported) {
       showToast('Live voice mode requires Chrome or Edge browser with microphone support.', 'error');
@@ -157,6 +276,7 @@ class LiveModeController {
     }
 
     // Unlock browser AudioContext inside this click gesture
+    this.liveAudioQueue.unlock();
     this.app.audioPlayer.unlock();
     this.app.micController?.stop();
 
@@ -169,16 +289,13 @@ class LiveModeController {
     if (this.userCaption) this.userCaption.textContent = '';
     if (this.jarvisCaption) this.jarvisCaption.textContent = 'Listening, Boss...';
 
-    // Show subtle banner if server is not yet connected
-    const isConnected = this.app.ws && this.app.ws.readyState === WebSocket.OPEN;
-    if (this.connectionNote) {
-      this.connectionNote.classList.toggle('hidden', isConnected);
-    }
-
     if (this.overlay) {
       this.overlay.classList.remove('hidden');
       requestAnimationFrame(() => this.overlay.classList.add('open'));
     }
+
+    // Connect dedicated Live WebSocket
+    this.connectLiveWs();
 
     // Start background Neural Silero VAD for instant voice barge-in
     this._vad.start().catch((e) => console.warn('[LiveMode] Silero VAD start warning:', e));
@@ -189,9 +306,17 @@ class LiveModeController {
   exit() {
     this.isActive = false;
     clearTimeout(this._restartTimer);
+    clearTimeout(this._silenceTimer);
     this._stt.abort();
     this._vad.stop();
+    this.liveAudioQueue.stop();
     this.app.audioPlayer.stop();
+
+    if (this.liveWs) {
+      try { this.liveWs.close(); } catch (_) {}
+      this.liveWs = null;
+    }
+
     this.setState('idle');
 
     if (this.overlay) {
@@ -208,6 +333,7 @@ class LiveModeController {
 
     if (this.isMuted) {
       clearTimeout(this._restartTimer);
+      clearTimeout(this._silenceTimer);
       this._stt.abort();
       this._vad.stop();
       if (this.state === 'listening') this.setState('paused');
@@ -237,11 +363,15 @@ class LiveModeController {
       idle: 'STANDBY',
       listening: 'LISTENING TO BOSS...',
       thinking: 'THINKING...',
-      speaking: 'J.A.R.V.I.S. SPEAKING (TAP ORB TO INTERRUPT)',
+      speaking: 'J.A.R.V.I.S. SPEAKING (INTERRUPT ANYTIME)',
       paused: 'MIC PAUSED (TAP TO RESUME)'
     };
     if (this.stateLabel) {
       this.stateLabel.textContent = labels[newState] || '';
+    }
+
+    if (newState === 'listening' || newState === 'paused') {
+      if (this.orb) this.orb.style.transform = 'scale(1)';
     }
   }
 
@@ -256,7 +386,7 @@ class LiveModeController {
   _scheduleListenRestart(delay = 350) {
     clearTimeout(this._restartTimer);
     this._restartTimer = setTimeout(() => {
-      if (this.isActive && !this.isMuted && !this.app.audioPlayer.isPlaying && this.state !== 'thinking') {
+      if (this.isActive && !this.isMuted && !this.liveAudioQueue.isPlaying && this.state !== 'thinking') {
         this.startListening();
       }
     }, delay);
@@ -264,15 +394,24 @@ class LiveModeController {
 
   _handleUserSpoke(text) {
     this._currentReplyText = '';
-    this._awaitingAudioForTurn = true;
     this.setState('thinking');
     if (this.jarvisCaption) this.jarvisCaption.textContent = '...';
 
     // Check if live server is connected
-    if (this.app.ws && this.app.ws.readyState === WebSocket.OPEN) {
+    if (this.liveWs && this.liveWs.readyState === WebSocket.OPEN) {
+      this.turnId++;
+      this.liveAudioQueue.startTurn(this.turnId);
+      this.liveWs.send(JSON.stringify({
+        type: 'utterance',
+        text: text,
+        turn_id: this.turnId,
+        conversation_id: this.app.activeConversationId,
+        mode: this.app.currentMode
+      }));
+    } else if (this.app.ws && this.app.ws.readyState === WebSocket.OPEN) {
       this.app.sendMessage(text, { liveMode: true, forceTts: true });
     } else {
-      // Offline UI Preview simulation so Boss can test the Live Mode experience locally
+      // Offline UI Preview simulation
       this._runOfflinePreviewResponse(text);
     }
   }
@@ -285,31 +424,19 @@ class LiveModeController {
     }
   }
 
-  onAudioReceived() {
-    if (!this.isActive) return;
-    this._awaitingAudioForTurn = false;
-    this.setState('speaking');
-  }
+  _updateOrbAudioReaction(level, mode) {
+    if (!this.orb) return;
+    const factor = mode === 'listening' ? 1.6 : 2.2;
+    const scale = 1.0 + Math.min(level * factor, 0.35);
+    this.orb.style.transform = `scale(${scale.toFixed(3)})`;
 
-  onResponseDone() {
-    if (!this.isActive) return;
-    // If TTS was disabled or no audio frame arrived, resume listening right away
-    setTimeout(() => {
-      if (this.isActive && !this.app.audioPlayer.isPlaying && this._awaitingAudioForTurn) {
-        this._awaitingAudioForTurn = false;
-        if (!this.isMuted) this.startListening();
-        else this.setState('paused');
-      }
-    }, 500);
-  }
-
-  onAudioPlaybackEnd() {
-    if (!this.isActive) return;
-    // Automatically reopen microphone after Jarvis finishes speaking!
-    if (!this.isMuted) {
-      this._scheduleListenRestart(300);
-    } else {
-      this.setState('paused');
+    const bars = this.orb.querySelectorAll('.orb-eq-bars span');
+    if (bars && bars.length === 5) {
+      const multipliers = [0.7, 1.1, 1.4, 1.0, 0.6];
+      bars.forEach((bar, i) => {
+        const h = Math.round(8 + Math.min(level * 100 * multipliers[i], 42));
+        bar.style.height = `${h}px`;
+      });
     }
   }
 

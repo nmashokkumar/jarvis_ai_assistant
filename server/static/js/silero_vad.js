@@ -10,15 +10,17 @@ class SileroVADManager {
     onSpeechStart,
     onSpeechEnd,
     onVADMisfire,
+    onAudioLevel,
     positiveSpeechThreshold = 0.5,
     negativeSpeechThreshold = 0.35,
-    redemptionFrames = 30, // ~1000ms (1 second) of real silence before declaring turn end
+    redemptionFrames = 25, // ~800ms of real silence before declaring turn end
     preSpeechPadFrames = 1,
-    minSpeechFrames = 3   // ~96ms minimum voice duration to trigger
+    minSpeechFrames = 8   // ~256ms (>= 250ms) minimum voice duration to trigger barge-in
   } = {}) {
     this.onSpeechStart = onSpeechStart;
     this.onSpeechEnd = onSpeechEnd;
     this.onVADMisfire = onVADMisfire;
+    this.onAudioLevel = onAudioLevel || null;
 
     this.positiveSpeechThreshold = positiveSpeechThreshold;
     this.negativeSpeechThreshold = negativeSpeechThreshold;
@@ -186,6 +188,14 @@ class SileroVADManager {
         if (!this.isListening) return;
         const inputData = e.inputBuffer.getChannelData(0);
 
+        // Compute RMS level for reactive voice visualizer
+        let sumSquares = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          sumSquares += inputData[i] * inputData[i];
+        }
+        const rms = Math.sqrt(sumSquares / inputData.length);
+        this.onAudioLevel?.(rms);
+
         // Linear resample from audioContext sampleRate down to 16000 Hz
         const resampled = this._resampleTo16k(inputData, sampleRate);
         for (let i = 0; i < resampled.length; i++) {
@@ -199,9 +209,14 @@ class SileroVADManager {
       };
 
       source.connect(processor);
-      processor.connect(this._audioCtx.destination);
+      // Mute loopback to prevent mic feedback howling out of speakers:
+      const muteNode = this._audioCtx.createGain();
+      muteNode.gain.setValueAtTime(0, this._audioCtx.currentTime);
+      processor.connect(muteNode);
+      muteNode.connect(this._audioCtx.destination);
       this._processor = processor;
       this._source = source;
+      this._muteNode = muteNode;
       this.isListening = true;
       this._resetModelStates();
       return true;
@@ -235,6 +250,10 @@ class SileroVADManager {
     if (this._source) {
       try { this._source.disconnect(); } catch (_) {}
       this._source = null;
+    }
+    if (this._muteNode) {
+      try { this._muteNode.disconnect(); } catch (_) {}
+      this._muteNode = null;
     }
     if (this._mediaStream) {
       try {

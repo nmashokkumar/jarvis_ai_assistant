@@ -130,6 +130,20 @@ class DatabaseManager:
         await self._touch_conversation(conversation_id)
         return row_id
 
+    async def update_message_content(self, message_id: int, content: str) -> None:
+        """Update an existing message's text content (e.g. on live interruption)."""
+        await self._execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            (content, message_id),
+        )
+
+    async def delete_message(self, message_id: int) -> None:
+        """Delete a message by ID."""
+        await self._execute(
+            "DELETE FROM messages WHERE id = ?",
+            (message_id,),
+        )
+
     async def get_messages(self, conversation_id: str, limit: int = 20) -> List[dict]:
         rows = await self._fetchall(
             """
